@@ -66,8 +66,8 @@ results = []
 
 # Avalia cada modelo treinado pelo AutoML
 for trial in summary.trials:
-    # Obtém o run_id do trial
-    run_id = trial.run_id
+    # Obtém o run_id do trial usando MLflow
+    run_id = trial.mlflow_run_id  # Acessa o run_id diretamente do TrialInfo
     
     # Carrega o modelo treinado usando MLflow
     model_uri = f"runs:/{run_id}/model"
@@ -104,7 +104,7 @@ for trial in summary.trials:
     })
 
 # Obtém o modelo vencedor
-best_model_run_id = summary.best_trial.run_id
+best_model_run_id = summary.best_trial.mlflow_run_id  # Acessa o run_id do melhor modelo
 best_model_uri = f"runs:/{best_model_run_id}/model"
 best_model = mlflow.spark.load_model(best_model_uri)
 
