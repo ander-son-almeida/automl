@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import numpy as np
 import os
+import shutil
 
 # Inicializa a sessão Spark
 spark = SparkSession.builder.appName("AutoML Binary Classification").getOrCreate()
@@ -27,7 +28,7 @@ columns = ["feature1", "feature2", "target"]
 # Cria o DataFrame
 df = spark.createDataFrame(data, columns)
 
-# Configura o diretório de saída para os resultados do AutoML
+# Configura o diretório de saída personalizado
 output_dir = "/dbfs/FileStore/automl_results"  # Defina o diretório de sua preferência
 os.makedirs(output_dir, exist_ok=True)  # Cria o diretório se não existir
 
@@ -37,8 +38,7 @@ summary = automl.classify(
     target_col="target",
     primary_metric="accuracy",  # Métrica primária (pode ser alterada para "roc_auc", "f1", etc.)
     timeout_minutes=30,
-    max_trials=10,
-    output_dir=output_dir  # Define o diretório de saída
+    max_trials=10
 )
 
 # Função para calcular o KS
@@ -66,8 +66,15 @@ results = []
 
 # Avalia cada modelo treinado pelo AutoML
 for trial in summary.trials:
+    # Obtém o run_id do trial
+    run_id = trial.run_id
+    
+    # Carrega o modelo treinado usando MLflow
+    model_uri = f"runs:/{run_id}/model"
+    model = mlflow.spark.load_model(model_uri)
+    
     # Obtém as previsões do modelo
-    predictions = trial.model.transform(df)
+    predictions = model.transform(df)
     
     # Converte as previsões para Pandas para facilitar o cálculo das métricas
     predictions_pd = predictions.select("target", "probability").toPandas()
@@ -92,12 +99,14 @@ for trial in summary.trials:
         "pr_auc": pr_auc,
         "f1_score": f1_score,
         "ks": ks,
-        "model_id": None,  # Será preenchido após salvar o modelo
+        "run_id": run_id,  # Salva o run_id para referência
         "predictions": predictions_pd  # Salva as previsões para plotar gráficos
     })
 
 # Obtém o modelo vencedor
-best_model = summary.best_trial.model
+best_model_run_id = summary.best_trial.run_id
+best_model_uri = f"runs:/{best_model_run_id}/model"
+best_model = mlflow.spark.load_model(best_model_uri)
 
 # Salva o modelo vencedor no MLflow
 with mlflow.start_run():
@@ -106,7 +115,7 @@ with mlflow.start_run():
 
 # Atualiza o ID do modelo vencedor na tabela de resultados
 for result in results:
-    if result["model_name"] == summary.best_trial.model_name:
+    if result["run_id"] == best_model_run_id:
         result["model_id"] = model_id
 
 # Cria um DataFrame com os resultados
@@ -217,3 +226,16 @@ for result in results:
     
     print(f"\nGráficos para o modelo: {model_name}")
     plot_metrics(y_true, y_prob, model_name)
+
+# Move os notebooks gerados pelo AutoML para o diretório de saída
+automl_output_dir = summary.experiment_dir  # Diretório padrão onde o AutoML salva os resultados
+if os.path.exists(automl_output_dir):
+    notebooks_dir = os.path.join(output_dir, "notebooks")
+    os.makedirs(notebooks_dir, exist_ok=True)
+    for item in os.listdir(automl_output_dir):
+        item_path = os.path.join(automl_output_dir, item)
+        if os.path.isdir(item_path) and item.endswith("_notebook"):
+            shutil.move(item_path, notebooks_dir)
+    print(f"Notebooks do AutoML movidos para: {notebooks_dir}")
+else:
+    print("Diretório de saída do AutoML não encontrado.")
