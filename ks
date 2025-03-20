@@ -6,28 +6,28 @@ from pyspark.ml.linalg import Vectors
 # Inicializar a sessão do Spark
 spark = SparkSession.builder.appName("KS Calculation with DenseVector").getOrCreate()
 
-# Exemplo de dados com DenseVector
+# Exemplo de dados com DenseVector contendo duas probabilidades
 data = [
-    (0, Vectors.dense([0.1])),  # label, probability (DenseVector)
-    (1, Vectors.dense([0.4])),
-    (0, Vectors.dense([0.35])),
-    (1, Vectors.dense([0.8])),
-    (0, Vectors.dense([0.2])),
-    (1, Vectors.dense([0.9])),
-    (0, Vectors.dense([0.3])),
-    (1, Vectors.dense([0.7])),
-    (0, Vectors.dense([0.05])),
-    (1, Vectors.dense([0.6]))
+    (0, Vectors.dense([0.9, 0.1])),  # label, probability (DenseVector com [P(0), P(1)])
+    (1, Vectors.dense([0.6, 0.4])),
+    (0, Vectors.dense([0.65, 0.35])),
+    (1, Vectors.dense([0.2, 0.8])),
+    (0, Vectors.dense([0.8, 0.2])),
+    (1, Vectors.dense([0.1, 0.9])),
+    (0, Vectors.dense([0.7, 0.3])),
+    (1, Vectors.dense([0.3, 0.7])),
+    (0, Vectors.dense([0.95, 0.05])),
+    (1, Vectors.dense([0.4, 0.6]))
 ]
 
 # Criar DataFrame
 df = spark.createDataFrame(data, ["label", "probability"])
 
-# Extrair a probabilidade da coluna DenseVector
-df = df.withColumn("probability", F.col("probability").getItem(0))
+# Extrair a probabilidade da classe positiva (segundo elemento do DenseVector)
+df = df.withColumn("probability_positive", F.col("probability").getItem(1))
 
 # Ordenar as probabilidades em ordem decrescente
-window_spec = Window.orderBy(F.desc("probability"))
+window_spec = Window.orderBy(F.desc("probability_positive"))
 df = df.withColumn("rank", F.row_number().over(window_spec))
 
 # Calcular o total de positivos e negativos
