@@ -62,3 +62,49 @@ print(f"KS Statistic: {ks_statistic:.4f}")
 
 # Parar a sessão do Spark
 spark.stop()
+
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, row_number
+from pyspark.sql.window import Window
+import numpy as np
+
+# Criar sessão Spark
+spark = SparkSession.builder.appName("KS Test for Binary Classification").getOrCreate()
+
+# Exemplo de dados
+data = [
+    (0.8, 1),
+    (0.3, 0),
+    (0.6, 1),
+    (0.4, 0),
+    (0.7, 1),
+    (0.2, 0)
+]
+
+# Criar DataFrame
+df = spark.createDataFrame(data, ["probabilidade", "classe_real"])
+
+# Separar as probabilidades por classe
+df_class_1 = df.filter(col("classe_real") == 1).select("probabilidade")
+df_class_0 = df.filter(col("classe_real") == 0).select("probabilidade")
+
+# Calcular as CDFs para cada classe
+window_spec = Window.orderBy("probabilidade")
+
+df_class_1 = df_class_1.withColumn("cdf", row_number().over(window_spec) / lit(df_class_1.count()))
+df_class_0 = df_class_0.withColumn("cdf", row_number().over(window_spec) / lit(df_class_0.count()))
+
+# Juntar as CDFs em um único DataFrame
+df_cdf = df_class_1.select("probabilidade", "cdf").union(df_class_0.select("probabilidade", "cdf"))
+
+# Calcular a diferença entre as CDFs
+df_cdf = df_cdf.withColumn("diff", col("cdf").cast("double") - col("cdf").cast("double"))
+
+# Encontrar a diferença máxima (estatística KS)
+ks_statistic = df_cdf.agg({"diff": "max"}).collect()[0][0]
+print(f"KS Statistic: {ks_statistic}")
+
+# Fechar sessão Spark
+spark.stop()
