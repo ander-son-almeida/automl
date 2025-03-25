@@ -149,3 +149,29 @@ run_id = result_df[result_df["Modelo"] == "Modelo Otimizado"]["Run ID"].values[0
 
 # Carregar o modelo
 model = mlflow.spark.load_model(f"runs:/{run_id}/{winning_model_name}_optimized")
+
+
+
+%pip install h2o pysparkling-water
+
+from pysparkling import *
+import h2o
+from h2o.automl import H2OAutoML
+
+# Inicializar H2O
+hc = H2OContext.getOrCreate(spark)
+
+# Carregar dados
+df_spark = spark.table("tabela_classificacao")
+h2o_frame = hc.asH2OFrame(df_spark)
+
+# Configurar AutoML
+aml = H2OAutoML(max_models=10, seed=42, max_runtime_secs=300, sort_metric="AUC")
+aml.train(x=features, y="target", training_frame=h2o_frame)
+
+# Melhor modelo
+best_model = aml.leader
+print(best_model)
+
+# Salvar modelo
+h2o.save_model(best_model, path="/dbfs/meus_modelos/h2o_automl_model", force=True)
