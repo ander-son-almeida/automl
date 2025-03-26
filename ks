@@ -1,110 +1,148 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.ml.linalg import Vectors
-
-# Inicializar a sessão do Spark
-spark = SparkSession.builder.appName("KS Calculation with DenseVector").getOrCreate()
-
-# Exemplo de dados com DenseVector contendo duas probabilidades
-data = [
-    (0, Vectors.dense([0.9, 0.1])),  # label, probability (DenseVector com [P(0), P(1)])
-    (1, Vectors.dense([0.6, 0.4])),
-    (0, Vectors.dense([0.65, 0.35])),
-    (1, Vectors.dense([0.2, 0.8])),
-    (0, Vectors.dense([0.8, 0.2])),
-    (1, Vectors.dense([0.1, 0.9])),
-    (0, Vectors.dense([0.7, 0.3])),
-    (1, Vectors.dense([0.3, 0.7])),
-    (0, Vectors.dense([0.95, 0.05])),
-    (1, Vectors.dense([0.4, 0.6]))
-]
-
-# Criar DataFrame
-df = spark.createDataFrame(data, ["label", "probability"])
-
-# Extrair a probabilidade da classe positiva (segundo elemento do DenseVector)
-df = df.withColumn("probability_positive", F.col("probability").getItem(1))
-
-# Ordenar as probabilidades em ordem decrescente
-window_spec = Window.orderBy(F.desc("probability_positive"))
-df = df.withColumn("rank", F.row_number().over(window_spec))
-
-# Calcular o total de positivos e negativos
-total_positives = df.filter(F.col("label") == 1).count()
-total_negatives = df.filter(F.col("label") == 0).count()
-
-# Calcular as distribuições cumulativas
-df = df.withColumn(
-    "cumulative_positives",
-    F.sum(F.when(F.col("label") == 1, 1).otherwise(0)).over(window_spec)
-).withColumn(
-    "cumulative_negatives",
-    F.sum(F.when(F.col("label") == 0, 1).otherwise(0)).over(window_spec)
-)
-
-# Calcular TPR e FPR
-df = df.withColumn(
-    "TPR",
-    F.col("cumulative_positives") / total_positives
-).withColumn(
-    "FPR",
-    F.col("cumulative_negatives") / total_negatives
-)
-
-# Calcular a diferença KS (TPR - FPR)
-df = df.withColumn("KS", F.col("TPR") - F.col("FPR"))
-
-# Encontrar o valor máximo de KS
-ks_statistic = df.agg(F.max("KS")).collect()[0][0]
-
-print(f"KS Statistic: {ks_statistic:.4f}")
-
-# Parar a sessão do Spark
-spark.stop()
-
-
-
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, row_number
-from pyspark.sql.window import Window
+import matplotlib.pyplot as plt
 import numpy as np
 
-# Criar sessão Spark
-spark = SparkSession.builder.appName("KS Test for Binary Classification").getOrCreate()
+# Inicializa a sessão do Spark
+spark = SparkSession.builder \
+    .appName("Cálculo KS") \
+    .getOrCreate()
 
-# Exemplo de dados
-data = [
-    (0.8, 1),
-    (0.3, 0),
-    (0.6, 1),
-    (0.4, 0),
-    (0.7, 1),
-    (0.2, 0)
-]
+# Configuração para gerar dados de exemplo
+np.random.seed(42)
+n_amostras = 1000
 
-# Criar DataFrame
-df = spark.createDataFrame(data, ["probabilidade", "classe_real"])
+# Simula probabilidades (0 a 1) - bons têm probabilidades menores em média
+prob_bons = np.random.beta(2, 5, size=int(n_amostras*0.7))  # 70% bons
+prob_maus = np.random.beta(5, 2, size=int(n_amostras*0.3))  # 30% maus
 
-# Separar as probabilidades por classe
-df_class_1 = df.filter(col("classe_real") == 1).select("probabilidade")
-df_class_0 = df.filter(col("classe_real") == 0).select("probabilidade")
+# Combina os dados
+probabilidades = np.concatenate([prob_bons, prob_maus])
+target = np.concatenate([np.zeros(len(prob_bons)), np.ones(len(prob_maus))])
 
-# Calcular as CDFs para cada classe
-window_spec = Window.orderBy("probabilidade")
+# Embaralha os dados
+indices = np.arange(n_amostras)
+np.random.shuffle(indices)
+probabilidades = probabilidades[indices]
+target = target[indices]
 
-df_class_1 = df_class_1.withColumn("cdf", row_number().over(window_spec) / lit(df_class_1.count()))
-df_class_0 = df_class_0.withColumn("cdf", row_number().over(window_spec) / lit(df_class_0.count()))
+# Cria DataFrame do PySpark
+dados = list(zip(target.astype(int), probabilidades.astype(float)))
+df = spark.createDataFrame(dados, ["target", "probabilidade"])
 
-# Juntar as CDFs em um único DataFrame
-df_cdf = df_class_1.select("probabilidade", "cdf").union(df_class_0.select("probabilidade", "cdf"))
+# Mostra as primeiras linhas
+print("Primeiras linhas dos dados:")
+df.show(5)
 
-# Calcular a diferença entre as CDFs
-df_cdf = df_cdf.withColumn("diff", col("cdf").cast("double") - col("cdf").cast("double"))
+# Estatísticas básicas
+print("\nEstatísticas descritivas:")
+df.groupBy("target").agg(
+    F.count("probabilidade").alias("contagem"),
+    F.mean("probabilidade").alias("média"),
+    F.stddev("probabilidade").alias("desvio_padrao"),
+    F.min("probabilidade").alias("minimo"),
+    F.max("probabilidade").alias("maximo")
+).show()
 
-# Encontrar a diferença máxima (estatística KS)
-ks_statistic = df_cdf.agg({"diff": "max"}).collect()[0][0]
-print(f"KS Statistic: {ks_statistic}")
+# Função para calcular o KS no PySpark
+def calcular_ks_spark(df, coluna_target="target", coluna_prob="probabilidade"):
+    """
+    Calcula a estatística KS em um DataFrame do PySpark
+    
+    Parâmetros:
+    df - DataFrame do PySpark
+    coluna_target - nome da coluna com os valores reais (0 e 1)
+    coluna_prob - nome da coluna com as probabilidades previstas
+    
+    Retorna:
+    valor_ks - valor da estatística KS
+    df_ks_pandas - DataFrame pandas com as curvas acumuladas (apenas para plotagem)
+    """
+    # Calcula totais de bons e maus
+    totais = df.agg(
+        F.sum(F.when(F.col(coluna_target) == 0, 1).otherwise(0)).alias("total_bons"),
+        F.sum(F.when(F.col(coluna_target) == 1, 1).otherwise(0)).alias("total_maus")
+    ).collect()[0]
+    
+    total_bons = totais["total_bons"]
+    total_maus = totais["total_maus"]
+    
+    # Ordena por probabilidade decrescente
+    janela = Window.orderBy(F.desc(coluna_prob))
+    
+    # Calcula as distribuições acumuladas
+    df_ks = df.withColumn("num_linha", F.row_number().over(janela)) \
+        .withColumn("acum_bons", F.sum(F.when(F.col(coluna_target) == 0, 1).otherwise(0)).over(janela) / total_bons) \
+        .withColumn("acum_maus", F.sum(F.when(F.col(coluna_target) == 1, 1).otherwise(0)).over(janela) / total_maus) \
+        .withColumn("ks", F.col("acum_maus") - F.col("acum_bons"))
+    
+    # Encontra o máximo KS
+    linha_ks = df_ks.orderBy(F.desc("ks")).first()
+    valor_ks = linha_ks["ks"]
+    
+    # Converte apenas as colunas necessárias para pandas (curvas acumuladas)
+    df_ks_pandas = df_ks.select(coluna_prob, "acum_bons", "acum_maus", "ks").orderBy(coluna_prob).toPandas()
+    
+    return valor_ks, df_ks_pandas
 
-# Fechar sessão Spark
+# Função para plotar o gráfico KS
+def plotar_ks_spark(df_ks_pandas, valor_ks, coluna_prob="probabilidade"):
+    """
+    Plota as curvas acumuladas e destaca a estatística KS
+    
+    Parâmetros:
+    df_ks_pandas - DataFrame pandas com as curvas acumuladas
+    valor_ks - valor da estatística KS
+    coluna_prob - nome da coluna com as probabilidades
+    """
+    # Encontra o ponto do KS
+    ponto_ks = df_ks_pandas['ks'].idxmax()
+    
+    # Configurações do gráfico
+    plt.figure(figsize=(10, 6))
+    
+    # Plota as curvas acumuladas
+    plt.plot(df_ks_pandas[coluna_prob], df_ks_pandas['acum_bons'], label='Bons (0)', color='blue')
+    plt.plot(df_ks_pandas[coluna_prob], df_ks_pandas['acum_maus'], label='Maus (1)', color='red')
+    
+    # Destaca o ponto do KS
+    plt.axvline(x=df_ks_pandas.loc[ponto_ks, coluna_prob], color='gray', linestyle='--', 
+                label=f'Ponto KS (Prob={df_ks_pandas.loc[ponto_ks, coluna_prob]:.2f})')
+    
+    # Adiciona linha da diferença KS
+    plt.plot([df_ks_pandas.loc[ponto_ks, coluna_prob], df_ks_pandas.loc[ponto_ks, coluna_prob]],
+             [df_ks_pandas.loc[ponto_ks, 'acum_bons'], df_ks_pandas.loc[ponto_ks, 'acum_maus']],
+             color='green', linestyle='-', linewidth=2,
+             label=f'Diferença KS = {valor_ks:.3f}')
+    
+    # Configurações adicionais
+    plt.title(f'Curva KS - Estatística KS = {valor_ks:.3f}', fontsize=14)
+    plt.xlabel('Probabilidade Cortada', fontsize=12)
+    plt.ylabel('Proporção Acumulada', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='lower right')
+    
+    plt.show()
+
+# ------------------------------------------
+# CALCULA E PLOTA O KS
+# ------------------------------------------
+valor_ks, df_ks_pandas = calcular_ks_spark(df)
+print(f"\nEstatística KS calculada: {valor_ks:.4f}")
+
+# Plotagem do gráfico (aqui converte para pandas apenas as curvas acumuladas)
+plotar_ks_spark(df_ks_pandas, valor_ks)
+
+# Interpretação do KS
+if valor_ks < 0.2:
+    print("Interpretação: Poder discriminatório fraco")
+elif 0.2 <= valor_ks < 0.3:
+    print("Interpretação: Poder discriminatório razoável")
+elif 0.3 <= valor_ks < 0.5:
+    print("Interpretação: Poder discriminatório bom")
+else:
+    print("Interpretação: Poder discriminatório muito forte")
+
+# Encerra a sessão do Spark
 spark.stop()
