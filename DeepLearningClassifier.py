@@ -38,7 +38,7 @@ elif winning_model_name == "DeepLearningClassifier":
     )
 
 # Tamanho de Amostra Recomendado para Deep Learning em Dados Tabulares
-
+https://arxiv.org/abs/2106.03253
 Para o `DeepLearningClassifier` (ou qualquer modelo de redes neurais em dados estruturados), as recomendações de tamanho amostral variam conforme a complexidade do problema, mas aqui estão diretrizes gerais baseadas na literatura:
 
 ## **Recomendações Gerais**
