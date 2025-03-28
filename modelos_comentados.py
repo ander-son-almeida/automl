@@ -479,3 +479,255 @@ def calculate_ks(predictions, target_col):
         .collect()[0][0]
     
     return ks_value
+
+
+
+
+
+
+
+## ======================================
+## 6. XGBOOST CLASSIFIER - Algoritmo Premiado
+## ======================================
+def get_xgb_params(trial):
+    """
+    Configuração completa para XGBoost com:
+    - Controles rigorosos de overfitting
+    - Parâmetros específicos para dados desbalanceados
+    - Otimização para performance computacional
+    """
+    return {
+        # n_estimators: Número de árvores no ensemble
+        # - Em crédito, 50-150 é suficiente devido ao desbalanceamento
+        # - Valores maiores (>200) raramente trazem benefícios
+        "n_estimators": trial.suggest_int("n_estimators", 50, 150),
+        
+        # max_depth: Profundidade máxima das árvores
+        # - Limitado a 3-6 para evitar overfitting
+        # - Árvores mais rasas são mais generalizáveis
+        "max_depth": trial.suggest_int("max_depth", 3, 6),
+        
+        # learning_rate: Taxa de aprendizado (eta)
+        # - 0.05-0.2 para convergência estável
+        # - Valores menores exigem mais árvores
+        "learning_rate": trial.suggest_float("learning_rate", 0.05, 0.2),
+        
+        # subsample: Fração de amostras por árvore
+        # - Stochastic boosting para robustez
+        # - 0.7-0.9 mantém boa diversidade
+        "subsample": trial.suggest_float("subsample", 0.7, 0.9),
+        
+        # colsample_bytree: Fração de features por árvore
+        # - Similar ao featureSubsetStrategy do RF
+        # - Reduz correlação entre árvores
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 0.9),
+        
+        # scale_pos_weight: Controle de desbalanceamento
+        # - Calculado como count(negativos)/count(positivos)
+        # - Ex: Se 5% são ruins, usar ~19 (95/5)
+        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 5, 20),
+        
+        # gamma: Redução mínima de loss para split
+        # - 0-5: Valores maiores criam árvores mais conservadoras
+        "gamma": trial.suggest_float("gamma", 0, 5),
+        
+        # reg_alpha: Regularização L1 (similar ao LASSO)
+        # - 0-10: Controla seleção de features
+        "reg_alpha": trial.suggest_float("reg_alpha", 0, 10),
+        
+        # reg_lambda: Regularização L2 (similar ao Ridge)
+        # - 0-10: Previne overfitting
+        "reg_lambda": trial.suggest_float("reg_lambda", 0, 10),
+        
+        # tree_method: Algoritmo de construção
+        # - 'hist' é o mais eficiente para grandes datasets
+        # - 'approx' para datasets médios
+        "tree_method": trial.suggest_categorical("tree_method", ["hist", "approx"]),
+        
+        # grow_policy: Estratégia de crescimento
+        # - 'depthwise' é mais conservador
+        # - 'lossguide' pode ser mais preciso mas propenso a overfitting
+        "grow_policy": trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
+        
+        # eval_metric: Métrica de avaliação
+        # - 'aucpr' é ideal para dados desbalanceados
+        "eval_metric": "aucpr",
+        
+        # n_jobs: Paralelismo
+        # - Limitar para não sobrecarregar o cluster
+        "n_jobs": 4
+    }
+
+## ======================================
+## 7. LINEAR SVC - Máquina de Vetores de Suporte
+## ======================================
+def get_svc_params(trial):
+    """
+    Configuração para SVM Linear com:
+    - Regularização adaptativa
+    - Otimização para datasets grandes
+    - Controle de margens para classes desbalanceadas
+    """
+    return {
+        # regParam: Força da regularização
+        # - Range amplo (1e-4 a 10) em escala log
+        # - Valores altos aumentam a margem para a classe minoritária
+        "regParam": trial.suggest_float("regParam", 1e-4, 10, log=True),
+        
+        # maxIter: Número máximo de iterações
+        # - 50-200 é suficiente para convergência
+        # - Valores maiores são custosos computacionalmente
+        "maxIter": trial.suggest_int("maxIter", 50, 200),
+        
+        # standardization: Crítico para SVM
+        # - Features devem estar na mesma escala
+        "standardization": True,
+        
+        # fitIntercept: Controla o bias
+        # - Sempre True em modelos de crédito
+        "fitIntercept": True,
+        
+        # threshold: Ponto de corte para classificação
+        # - Ajuste fino para dados desbalanceados
+        "threshold": trial.suggest_float("threshold", 0.3, 0.7),
+        
+        # aggregationDepth: Profundidade para agregação
+        # - Valores maiores (2-10) melhoram precisão
+        # - Aumenta custo computacional
+        "aggregationDepth": trial.suggest_int("aggregationDepth", 2, 10)
+    }
+
+## ======================================
+## 8. NAIVE BAYES - Modelo Probabilístico
+## ======================================
+def get_nb_params(trial):
+    """
+    Configuração para Naive Bayes com:
+    - Suavização adaptativa para features raras
+    - Controle de thresholds por classe
+    - Otimização para variáveis categóricas
+    """
+    return {
+        # smoothing: Laplace smoothing
+        # - Evita probabilidades zero para features ausentes
+        # - 0.5-5.0 é ideal para dados financeiros
+        "smoothing": trial.suggest_float("smoothing", 0.5, 5.0),
+        
+        # modelType: Tipo de modelo
+        # - 'multinomial' para contagens/features discretas
+        # - 'bernoulli' para features binárias
+        "modelType": trial.suggest_categorical("modelType", ["multinomial", "bernoulli"]),
+        
+        # thresholds: Thresholds por classe
+        # - Permite ajuste fino do tradeoff precision-recall
+        # - Valores diferentes para cada classe compensam desbalanceamento
+        "thresholds": [
+            trial.suggest_float("threshold_0", 0.3, 0.7),  # Classe negativa
+            trial.suggest_float("threshold_1", 0.3, 0.7)   # Classe positiva
+        ]
+    }
+
+## ======================================
+## 9. MULTILAYER PERCEPTRON - Rede Neural
+## ======================================
+def get_mlp_params(trial, num_features):
+    """
+    Configuração para MLP com:
+    - Arquitetura adaptável ao número de features
+    - Regularização implícita via estrutura
+    - Controle de overfitting para dados desbalanceados
+    """
+    return {
+        # layers: Arquitetura da rede
+        # - [input, hidden1, hidden2, output]
+        # - hidden1: 10-50 neurônios
+        # - hidden2: 5-20 neurônios
+        "layers": [
+            num_features,
+            trial.suggest_int("hidden1", 10, 50),
+            trial.suggest_int("hidden2", 5, 20),
+            2  # Saída binária
+        ],
+        
+        # maxIter: Número de épocas
+        # - 50-150 é suficiente para convergência
+        "maxIter": trial.suggest_int("maxIter", 50, 150),
+        
+        # blockSize: Tamanho do batch
+        # - 32-128: Valores maiores aceleram treino
+        # - Valores menores podem melhorar generalização
+        "blockSize": trial.suggest_categorical("blockSize", [32, 64, 128]),
+        
+        # solver: Algoritmo de otimização
+        # - 'l-bfgs' para datasets médios (<10k samples)
+        # - 'gd' para datasets grandes
+        "solver": trial.suggest_categorical("solver", ["l-bfgs", "gd"]),
+        
+        # stepSize: Learning rate
+        # - Valores pequenos (1e-5 a 0.1) em log scale
+        "stepSize": trial.suggest_float("stepSize", 1e-5, 0.1, log=True),
+        
+        # tol: Tolerância para parada
+        # - 1e-6 a 1e-3 para balancear precisão/tempo
+        "tol": trial.suggest_float("tol", 1e-6, 1e-3, log=True)
+    }
+
+## ======================================
+## 10. FACTORIZATION MACHINES - Modelo Fatorial
+## ======================================
+def get_fm_params(trial):
+    """
+    Configuração para Factorization Machines:
+    - Modela interações entre features
+    - Ideal para dados com features categóricas
+    - Regularização robusta
+    """
+    return {
+        # factorSize: Dimensão dos fatores latentes
+        # - 2-8 é suficiente para capturar interações
+        # - Valores maiores podem overfittar
+        "factorSize": trial.suggest_int("factorSize", 2, 8),
+        
+        # regParam: Regularização
+        # - 0.01-0.1: Valores altos previnem overfitting
+        "regParam": trial.suggest_float("regParam", 0.01, 0.1),
+        
+        # stepSize: Taxa de aprendizado
+        # - 0.001-0.1: Valores pequenos para estabilidade
+        "stepSize": trial.suggest_float("stepSize", 0.001, 0.1),
+        
+        # initStd: Desvio padrão para inicialização
+        # - 0.01-1.0: Escala dos pesos iniciais
+        "initStd": trial.suggest_float("initStd", 0.01, 1.0),
+        
+        # maxIter: Número de iterações
+        # - 50-300: Suficiente para convergência
+        "maxIter": trial.suggest_int("maxIter", 50, 300)
+    }
+
+## ======================================
+## 11. ONE VS REST - Meta-classificador
+## ======================================
+def get_ovr_params(trial):
+    """
+    Configuração para OneVsRest que:
+    - Permite extensão a multiclasse
+    - Usa Logistic Regression como base
+    - Mantém interpretabilidade
+    """
+    return {
+        # classifier: Modelo base (usamos LogisticRegression)
+        "classifier": LogisticRegression(
+            featuresCol='features',
+            labelCol=target_col,
+            regParam=trial.suggest_float("lr_regParam", 0.01, 10.0, log=True),
+            elasticNetParam=trial.suggest_float("lr_elasticNetParam", 0.0, 1.0),
+            maxIter=trial.suggest_int("lr_maxIter", 50, 200),
+            standardization=True,
+            threshold=trial.suggest_float("lr_threshold", 0.3, 0.7)
+        ),
+        
+        # parallelism: Grau de paralelismo
+        # - 1-4: Balanceia velocidade e uso de recursos
+        "parallelism": trial.suggest_int("parallelism", 1, 4)
+    }
