@@ -1,0 +1,268 @@
+from pyspark.sql import SparkSession
+from pyspark.ml.stat import Correlation
+from pyspark.ml.feature import VectorAssembler
+import pyspark.sql.functions as F
+
+# Iniciar sessão Spark
+spark = SparkSession.builder.appName("CorrelationAnalysis").getOrCreate()
+
+
+# Exemplo de estrutura esperada:
+# df.show(5)
+# +-------+--------+--------+-----+
+# |feature1|feature2|feature3|target|
+# +-------+--------+--------+-----+
+# |    1.2|     5.4|     3.2|    1|
+# |    2.3|     4.1|     2.9|    0|
+# |    0.9|     6.2|     4.1|    1|
+# +-------+--------+--------+-----+
+
+
+# Lista de colunas numéricas (excluindo o target)
+numeric_cols = [col for col, dtype in df.dtypes if dtype in ('int', 'bigint', 'float', 'double') and col != 'target']
+
+# Calcular correlação ponto-bisserial (para relação entre numérica e binária)
+correlations = []
+for col in numeric_cols:
+    corr = df.stat.corr(col, 'target')
+    correlations.append((col, corr))
+    print(f"Correlação entre {col} e target: {corr:.4f}")
+
+# Criar DataFrame com os resultados
+corr_df = spark.createDataFrame(correlations, ["Feature", "Correlation"])
+corr_df.orderBy(F.abs(F.col("Correlation")).desc()).show()
+
+
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.stat import ChiSquareTest
+
+# Lista de colunas categóricas
+categorical_cols = [col for col, dtype in df.dtypes if dtype == 'string']
+
+# Teste qui-quadrado para cada variável categórica
+for col in categorical_cols:
+    # Converter categorias para índices numéricos
+    indexer = StringIndexer(inputCol=col, outputCol=col+"_index")
+    indexed_df = indexer.fit(df).transform(df)
+    
+    # Preparar dados para teste qui-quadrado
+    assembler = VectorAssembler(inputCols=[col+"_index"], outputCol="features")
+    assembled_df = assembler.transform(indexed_df)
+    
+    # Executar teste
+    r = ChiSquareTest.test(assembled_df, "features", "target").head()
+    print(f"Teste qui-quadrado para {col}:")
+    print(f"p-value: {r.pValue}")
+    print(f"Estatística: {r.statistic}")
+    print("--------------------------------")
+
+
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.stat import ChiSquareTest
+
+# Lista de colunas categóricas
+categorical_cols = [col for col, dtype in df.dtypes if dtype == 'string']
+
+# Teste qui-quadrado para cada variável categórica
+for col in categorical_cols:
+    # Converter categorias para índices numéricos
+    indexer = StringIndexer(inputCol=col, outputCol=col+"_index")
+    indexed_df = indexer.fit(df).transform(df)
+    
+    # Preparar dados para teste qui-quadrado
+    assembler = VectorAssembler(inputCols=[col+"_index"], outputCol="features")
+    assembled_df = assembler.transform(indexed_df)
+    
+    # Executar teste
+    r = ChiSquareTest.test(assembled_df, "features", "target").head()
+    print(f"Teste qui-quadrado para {col}:")
+    print(f"p-value: {r.pValue}")
+    print(f"Estatística: {r.statistic}")
+    print("--------------------------------")
+
+
+
+# Selecionar apenas colunas numéricas
+numeric_data = df.select(numeric_cols)
+
+# Criar vetor de features
+assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features")
+vector_data = assembler.transform(numeric_data).select("features")
+
+# Calcular matriz de correlação
+matrix = Correlation.corr(vector_data, "features").collect()[0][0]
+
+# Converter para matriz numpy para visualização
+corr_matrix = matrix.toArray()
+
+# Exibir matriz de correlação
+print("Matriz de correlação entre features:")
+for i, col in enumerate(numeric_cols):
+    print(f"{col:15}", end="")
+    for j in range(len(numeric_cols)):
+        print(f"{corr_matrix[i][j]:.2f}", end=" ")
+    print()
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Converter matriz para Pandas
+corr_pd = pd.DataFrame(corr_matrix, columns=numeric_cols, index=numeric_cols)
+
+# Plotar heatmap
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr_pd, annot=True, cmap='coolwarm', center=0)
+plt.title("Matriz de Correlação entre Features")
+plt.show()
+
+
+
+def calculate_vif(df, features):
+    """
+    Calcula o Variance Inflation Factor (VIF) para cada feature
+    
+    Args:
+        df: DataFrame Spark contendo os dados
+        features: Lista de nomes de colunas para calcular VIF
+    
+    Returns:
+        DataFrame com colunas 'Feature' e 'VIF'
+    """
+    vif_results = []
+    
+    for i, target_feature in enumerate(features):
+        # Features explicativas (todas exceto a target)
+        other_features = [f for f in features if f != target_feature]
+        
+        # Preparar dados para regressão
+        assembler = VectorAssembler(inputCols=other_features, outputCol="features")
+        lr = LinearRegression(featuresCol="features", labelCol=target_feature)
+        
+        # Transformar dados e ajustar modelo
+        assembled_data = assembler.transform(df.select(features))
+        model = lr.fit(assembled_data)
+        
+        # Calcular R² e VIF
+        r_squared = model.summary.r2
+        vif = 1. / (1. - r_squared) if r_squared < 1 else float('inf')
+        
+        vif_results.append((target_feature, float(vif)))
+    
+    return spark.createDataFrame(vif_results, ["Feature", "VIF"])
+
+
+
+# 1. Carregar dados (substitua com seu DataFrame real)
+# df = spark.read.csv("seu_arquivo.csv", header=True, inferSchema=True)
+
+# 2. Selecionar apenas colunas numéricas (excluindo target)
+numeric_cols = [col for col, dtype in df.dtypes 
+               if dtype in ('int', 'bigint', 'float', 'double') 
+               and col != 'target']
+
+# 3. Correlação com a variável target
+print("\nCorrelação com a variável target:")
+correlations = []
+for col in numeric_cols:
+    corr = df.stat.corr(col, 'target')
+    correlations.append((col, corr))
+    print(f"{col:20}: {corr:.4f}")
+
+# 4. Matriz de correlação entre features
+print("\nMatriz de correlação entre features:")
+assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features")
+vector_data = assembler.transform(df.select(numeric_cols)).select("features")
+corr_matrix = Correlation.corr(vector_data, "features").collect()[0][0].toArray()
+
+# Imprimir matriz de forma formatada
+print(" " * 20, end="")
+for col in numeric_cols:
+    print(f"{col[:8]:>8}", end="")
+print()
+
+for i, row in enumerate(corr_matrix):
+    print(f"{numeric_cols[i][:20]:20}", end="")
+    for val in row:
+        print(f"{val:8.2f}", end="")
+    print()
+
+# 5. Cálculo do VIF
+print("\nAnálise de VIF (Multicolinearidade):")
+vif_df = calculate_vif(df, numeric_cols)
+vif_df.orderBy(F.desc("VIF")).show()
+
+# Interpretação do VIF
+print("\nInterpretação do VIF:")
+print("VIF < 5: Baixa multicolinearidade")
+print("5 ≤ VIF < 10: Multicolinearidade moderada")
+print("VIF ≥ 10: Alta multicolinearidade (considere remover a variável)")
+
+
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml.stat import ChiSquareTest
+
+# Lista de colunas categóricas
+categorical_cols = [col for col, dtype in df.dtypes if dtype == 'string']
+
+if categorical_cols:
+    print("\nAnálise para variáveis categóricas:")
+    
+    # Processamento e teste para cada variável categórica
+    for col in categorical_cols:
+        # Indexar categorias
+        indexer = StringIndexer(inputCol=col, outputCol=col+"_index")
+        indexed_df = indexer.fit(df).transform(df)
+        
+        # Preparar dados para teste qui-quadrado
+        assembler = VectorAssembler(inputCols=[col+"_index"], outputCol="features")
+        assembled_df = assembler.transform(indexed_df)
+        
+        # Executar teste
+        r = ChiSquareTest.test(assembled_df, "features", "target").head()
+        print(f"\nVariável: {col}")
+        print(f"p-value: {r.pValue:.4f}")
+        print(f"Estatística qui-quadrado: {r.statistic:.2f}")
+        
+        # Calcular VIF para variáveis categóricas (após one-hot encoding)
+        encoder = OneHotEncoder(inputCol=col+"_index", outputCol=col+"_encoded")
+        encoded_df = encoder.fit(indexed_df).transform(indexed_df)
+        
+        # Obter nomes das colunas encoded
+        encoded_cols = [c for c in encoded_df.columns if c.endswith("_encoded")]
+        
+        if encoded_cols:
+            # Calcular VIF para as colunas encoded (excluindo a última para evitar dummy trap)
+            vif_cat = calculate_vif(encoded_df, encoded_cols[:-1])
+            print("VIF para categorias (exceto referência):")
+            vif_cat.show()
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Converter resultados para Pandas para visualização
+corr_pd = pd.DataFrame(corr_matrix, columns=numeric_cols, index=numeric_cols)
+vif_pd = vif_df.toPandas()
+
+plt.figure(figsize=(12, 10))
+
+# Heatmap de correlação
+plt.subplot(2, 1, 1)
+sns.heatmap(corr_pd, annot=True, cmap='coolwarm', center=0, fmt=".2f")
+plt.title("Matriz de Correlação entre Features")
+
+# Gráfico de barras para VIF
+plt.subplot(2, 1, 2)
+sns.barplot(x="VIF", y="Feature", data=vif_pd.sort_values("VIF", ascending=False))
+plt.axvline(x=5, color='r', linestyle='--', label='Limite VIF=5')
+plt.axvline(x=10, color='g', linestyle='--', label='Limite VIF=10')
+plt.title("Variance Inflation Factor (VIF)")
+plt.legend()
+
+plt.tight_layout()
+plt.show()
