@@ -266,3 +266,119 @@ plt.legend()
 
 plt.tight_layout()
 plt.show()
+
+
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression
+from pyspark.sql.functions import col, isnan, when, count
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder.appName("VIFAnalysis").getOrCreate()
+
+# Função para calcular VIF (excluindo a variável resposta)
+def calculate_vif(df, features):
+    vif_results = []
+    for target_feature in features:
+        # Todas as features exceto a atual (não inclui target!)
+        other_features = [f for f in features if f != target_feature]
+        
+        assembler = VectorAssembler(inputCols=other_features, outputCol="features")
+        lr = LinearRegression(featuresCol="features", labelCol=target_feature)
+        
+        # Remover linhas com NaN para a feature atual
+        df_no_na = df.dropna(subset=[target_feature])
+        assembled_data = assembler.transform(df_no_na.select(features))
+        
+        try:
+            model = lr.fit(assembled_data)
+            r_squared = model.summary.r2
+            vif = 1. / (1. - r_squared) if r_squared < 1 else float('inf')
+            vif_results.append((target_feature, float(vif)))
+        except:
+            # Caso haja erro (ex: colinearidade perfeita)
+            vif_results.append((target_feature, float('inf')))
+    
+    return spark.createDataFrame(vif_results, ["Feature", "VIF"])
+
+# Função para selecionar features não colineares
+def select_non_collinear_features(df, features, target_col="target", max_vif=5.0):
+    # 1. Calcular correlação com o target para priorização
+    corr_with_target = []
+    for feature in features:
+        corr = df.stat.corr(feature, target_col)
+        corr_with_target.append((feature, abs(corr) if corr is not None else 0.0))
+    
+    corr_df = spark.createDataFrame(corr_with_target, ["Feature", "Corr_with_target"])
+    
+    # 2. Calcular VIF entre features
+    vif_df = calculate_vif(df, features)
+    
+    # 3. Juntar resultados e ordenar
+    joined_df = vif_df.join(corr_df, "Feature").orderBy(F.desc("Corr_with_target"))
+    
+    # 4. Selecionar features iterativamente
+    selected_features = []
+    remaining_features = features.copy()
+    
+    while remaining_features:
+        # Calcular VIF atualizado
+        current_vif_df = calculate_vif(df, remaining_features)
+        
+        # Pegar feature com maior correlação com target
+        best_feature = corr_df.filter(col("Feature").isin(remaining_features)) \
+                             .orderBy(F.desc("Corr_with_target")) \
+                             .first()["Feature"]
+        
+        selected_features.append(best_feature)
+        remaining_features.remove(best_feature)
+        
+        # Recalcular VIF para as restantes
+        if remaining_features:
+            temp_df = calculate_vif(df.select(selected_features + remaining_features), remaining_features)
+            high_vif = temp_df.filter(col("VIF") > max_vif).collect()
+            
+            # Remover features com VIF alto
+            for row in high_vif:
+                if row["Feature"] in remaining_features:
+                    remaining_features.remove(row["Feature"])
+    
+    return selected_features
+
+# --------------------------------------------------
+# Exemplo de uso:
+# --------------------------------------------------
+
+# 1. Carregar dados (substitua pelo seu DataFrame)
+# df = spark.read.csv("dados.csv", header=True, inferSchema=True)
+
+# 2. Verificar valores NaN (opcional)
+print("Valores faltantes por coluna:")
+df.select([count(when(isnan(c) | col(c).isNull(), c)).alias(c) for c in df.columns]).show()
+
+# 3. Tratar NaN (exemplo: preencher com média)
+from pyspark.ml.feature import Imputer
+
+numeric_cols = [col for col, dtype in df.dtypes 
+               if dtype in ('int', 'bigint', 'float', 'double') 
+               and col != 'target']  # Exclui a variável resposta
+
+imputer = Imputer(inputCols=numeric_cols, 
+                 outputCols=numeric_cols,
+                 strategy="mean")
+
+df_imputed = imputer.fit(df).transform(df)
+
+# 4. Selecionar features não colineares
+selected_features = select_non_collinear_features(
+    df=df_imputed,
+    features=numeric_cols,
+    target_col="target",
+    max_vif=5.0  # Threshold para VIF
+)
+
+print("\nFeatures selecionadas (sem multicolinearidade):")
+print(selected_features)
+
+# 5. Criar novo DataFrame apenas com features selecionadas
+final_df = df_imputed.select(selected_features + ["target"])
