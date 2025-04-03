@@ -1,147 +1,140 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, rand, array, udf
-from pyspark.ml.feature import VectorAssembler, MinMaxScaler
-from pyspark.sql.types import ArrayType, FloatType
-import numpy as np
+from pyspark.sql import DataFrame
+from pyspark.ml.feature import VectorAssembler, StringIndexer, BucketedRandomProjectionLSH
+from pyspark.ml import Pipeline
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.linalg import VectorUDT
+import random
+from functools import reduce
+from typing import List
 
-# Iniciar sessão Spark
-spark = SparkSession.builder.appName("SMOTENumeric").getOrCreate()
+class SmoteConfig:
+    def __init__(self, k=5, multiplier=1, bucketLength=2.0, seed=42):
+        self.k = k  # número de vizinhos mais próximos a considerar
+        self.multiplier = multiplier  # quantas vezes replicar os dados sintéticos
+        self.bucketLength = bucketLength  # parâmetro para LSH
+        self.seed = seed  # semente para reprodutibilidade
 
-# Função UDF para calcular distâncias
-@udf(returnType=ArrayType(FloatType()))
-def calculate_distances(features, all_features):
-    point = np.array(features.toArray())
-    distances = []
-    for other in all_features:
-        other_point = np.array(other.toArray())
-        distance = float(np.linalg.norm(point - other_point))
-        distances.append(distance)
-    return distances
-
-# Função UDF para obter vizinhos mais próximos
-@udf(returnType=ArrayType(ArrayType(FloatType())))
-def get_k_neighbors(distances, k):
-    indices = np.argpartition(distances, k)[:k+1]
-    return [[float(i), float(distances[i])] for i in indices if distances[i] > 0]  # Exclui o próprio ponto
-
-# Função principal SMOTE para colunas numéricas
-def smote_numeric(df, target_col, numeric_cols, k=5, sampling_ratio=1.0):
+def smote_spark(df: DataFrame, target_col: str, num_cols: List[str], cat_cols: List[str] = None, config: SmoteConfig = None) -> DataFrame:
     """
-    Gera amostras sintéticas para colunas numéricas usando SMOTE
+    Aplica SMOTE para oversampling da classe minoritária em um DataFrame Spark.
     
     Args:
-        df: DataFrame Spark
-        target_col: Nome da coluna target (string)
-        numeric_cols: Lista de colunas numéricas (list)
-        k: Número de vizinhos (int)
-        sampling_ratio: Razão de oversampling (float)
-    
+        df: DataFrame Spark contendo os dados
+        target_col: Nome da coluna alvo binária (1 = classe minoritária)
+        num_cols: Lista de colunas numéricas
+        cat_cols: Lista de colunas categóricas (opcional)
+        config: Configurações do SMOTE (opcional)
+        
     Returns:
-        DataFrame balanceado
+        DataFrame Spark com oversampling aplicado
     """
-    # Identificar classes
-    class_counts = df.groupBy(target_col).count().collect()
-    minority_label = sorted([(x.count, x[target_col]) for x in class_counts])[0][1]
-    majority_label = sorted([(x.count, x[target_col]) for x in class_counts])[1][1]
+    if cat_cols is None:
+        cat_cols = []
     
-    minority_df = df.filter(col(target_col) == minority_label)
-    majority_df = df.filter(col(target_col) == majority_label)
+    if config is None:
+        config = SmoteConfig()
     
-    count_minority = minority_df.count()
-    count_majority = majority_df.count()
+    # Verifica se a coluna alvo é binária
+    distinct_values = df.select(target_col).distinct().collect()
+    if len(distinct_values) != 2:
+        raise ValueError("A coluna alvo deve ter exatamente 2 valores distintos")
     
-    # Calcular número de amostras sintéticas
-    num_synthetic = int((count_majority - count_minority) * sampling_ratio)
-    if num_synthetic <= 0:
-        return df
-    
-    # Pré-processamento: Normalizar features
-    assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features_vec")
-    minority_vec = assembler.transform(minority_df)
-    
-    scaler = MinMaxScaler(inputCol="features_vec", outputCol="scaled_features")
-    scaler_model = scaler.fit(minority_vec)
-    minority_scaled = scaler_model.transform(minority_vec)
-    
-    # Coletar pontos para cálculo de distância
-    minority_points = minority_scaled.select("scaled_features").collect()
-    all_points = [row.scaled_features for row in minority_points]
-    
-    # Calcular distâncias
-    minority_with_distances = minority_scaled.withColumn(
-        "distances", 
-        calculate_distances(col("scaled_features"), array([lit(x) for x in all_points]))
-    )
-    
-    # Identificar k vizinhos mais próximos
-    minority_with_neighbors = minority_with_distances.withColumn(
-        "neighbors",
-        get_k_neighbors(col("distances"), lit(k))
-    )
-    
-    # Gerar amostras sintéticas
-    synthetic_samples = []
-    minority_rows = minority_with_neighbors.collect()
-    
-    for i in range(num_synthetic):
-        # Selecionar ponto aleatório da minoria
-        idx = np.random.randint(0, len(minority_rows))
-        row = minority_rows[idx]
-        
-        if not row.neighbors:
-            continue
-            
-        # Selecionar vizinho aleatório
-        neighbor_idx, _ = row.neighbors[np.random.randint(0, len(row.neighbors))]
-        neighbor_row = minority_rows[int(neighbor_idx)]
-        
-        # Gerar ponto sintético
-        synthetic_row = {}
-        for col_name in numeric_cols:
-            original_val = row[col_name]
-            neighbor_val = neighbor_row[col_name]
-            gap = np.random.random()
-            synthetic_val = original_val + gap * (neighbor_val - original_val)
-            synthetic_row[col_name] = float(synthetic_val)
-        
-        synthetic_row[target_col] = minority_label
-        synthetic_samples.append(synthetic_row)
-    
-    # Combinar com dados originais
-    if synthetic_samples:
-        synthetic_df = spark.createDataFrame(synthetic_samples)
-        return df.unionByName(synthetic_df)
-    return df
-
-# Exemplo de uso
-if __name__ == "__main__":
-    # Dados de exemplo
-    data = [
-        (1.0, 2.0, 0),
-        (1.5, 1.8, 0),
-        (2.0, 3.0, 0),
-        (3.0, 2.5, 1),
-        (3.5, 2.0, 1),
-    ]
-    columns = ["feature1", "feature2", "label"]
-    df = spark.createDataFrame(data, columns)
-    
-    # Parâmetros
-    target_column = "label"
-    numeric_columns = ["feature1", "feature2"]
+    # Pré-processamento: preparar os dados para SMOTE
+    processed_df = _preprocess_for_smote(df, num_cols, cat_cols, target_col)
     
     # Aplicar SMOTE
-    balanced_df = smote_numeric(
-        df=df,
-        target_col=target_column,
-        numeric_cols=numeric_columns,
-        k=2,
-        sampling_ratio=1.0
+    oversampled_df = _apply_smote(processed_df, config)
+    
+    return oversampled_df
+
+def _preprocess_for_smote(df: DataFrame, num_cols: List[str], cat_cols: List[str], target_col: str) -> DataFrame:
+    """Prepara o DataFrame para SMOTE."""
+    # Remove a target_col das num_cols se estiver presente
+    if target_col in num_cols:
+        num_cols.remove(target_col)
+    
+    # Indexador para colunas categóricas (exceto target)
+    indexers = [
+        StringIndexer(inputCol=col, outputCol=f"{col}_index").fit(df) 
+        for col in cat_cols 
+        if col != target_col
+    ]
+    
+    # Assembler para colunas numéricas
+    assembler = VectorAssembler(inputCols=num_cols, outputCol="features")
+    
+    # Pipeline de transformação
+    pipeline = Pipeline(stages=indexers + [assembler])
+    transformed_df = pipeline.fit(df).transform(df)
+    
+    # Seleciona apenas colunas necessárias e renomeia target_col para "label"
+    keep_cols = [col for col in transformed_df.columns 
+                if col not in num_cols + cat_cols] + ["features"]
+    
+    return transformed_df.select(*keep_cols).withColumnRenamed(target_col, "label")
+
+def _apply_smote(df: DataFrame, config: SmoteConfig) -> DataFrame:
+    """Aplica o algoritmo SMOTE ao DataFrame preparado."""
+    # Separa classes minoritária (1) e majoritária (0)
+    df_min = df.filter(F.col("label") == 1)
+    df_maj = df.filter(F.col("label") == 0)
+    
+    # Se não há instâncias minoritárias, retorna o original
+    if df_min.count() == 0:
+        return df
+    
+    # Aplica LSH para encontrar vizinhos mais próximos
+    brp = BucketedRandomProjectionLSH(
+        inputCol="features",
+        outputCol="hashes",
+        seed=config.seed,
+        bucketLength=config.bucketLength
     )
+    model = brp.fit(df_min)
     
-    # Resultados
-    print("Distribuição original:")
-    df.groupBy("label").count().show()
+    # Encontra k vizinhos mais próximos para cada ponto
+    self_join = model.approxSimilarityJoin(
+        df_min, df_min, float("inf"), distCol="EuclideanDistance"
+    ).filter("EuclideanDistance > 0")  # remove auto-comparações
     
-    print("Distribuição após SMOTE:")
-    balanced_df.groupBy("label").count().show()
+    # Ordena por distância e seleciona os k mais próximos
+    window = Window.partitionBy("datasetA").orderBy("EuclideanDistance")
+    neighbors_df = self_join.withColumn("rn", F.row_number().over(window)) \
+                          .filter(F.col("rn") <= config.k) \
+                          .drop("rn")
+    
+    # Gera dados sintéticos
+    synthetic_data = []
+    
+    # UDFs para operações vetoriais
+    subtract_udf = F.udf(lambda arr: random.uniform(0, 1) * (arr[0] - arr[1]), VectorUDT())
+    add_udf = F.udf(lambda arr: arr[0] + arr[1], VectorUDT())
+    
+    original_cols = [col for col in df_min.columns if col != "features"]
+    
+    for _ in range(config.multiplier):
+        # Seleciona vizinho aleatório para cada ponto
+        rand_df = neighbors_df.withColumn("rand", F.rand(seed=config.seed))
+        max_rand_df = rand_df.withColumn("max_rand", F.max("rand").over(Window.partitionBy("datasetA")))
+        selected_df = max_rand_df.filter(F.col("rand") == F.col("max_rand")).drop("rand", "max_rand")
+        
+        # Cria features sintéticas
+        diff_df = selected_df.select("*", subtract_udf(F.array("datasetA.features", "datasetB.features")).alias("diff"))
+        synth_df = diff_df.select("*", add_udf(F.array("datasetA.features", "diff")).alias("features"))
+        
+        # Copia outras colunas (aleatoriamente do original ou vizinho)
+        for col_name in original_cols:
+            choice = random.choice(["datasetA", "datasetB"])
+            synth_df = synth_df.withColumn(col_name, F.col(f"{choice}.{col_name}"))
+        
+        synth_df = synth_df.drop("datasetA", "datasetB", "diff", "EuclideanDistance")
+        synthetic_data.append(synth_df)
+    
+    # Combina todos os dados sintéticos
+    if synthetic_data:
+        all_synthetic = reduce(DataFrame.unionAll, synthetic_data)
+        # Retorna dados originais + sintéticos
+        return df_maj.unionByName(df_min).unionByName(all_synthetic)
+    else:
+        return df
