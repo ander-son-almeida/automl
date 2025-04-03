@@ -1,16 +1,13 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, rand, array, udf
 from pyspark.ml.feature import VectorAssembler, MinMaxScaler
-from pyspark.ml.linalg import Vectors
-from pyspark.sql.types import ArrayType, FloatType, IntegerType
+from pyspark.sql.types import ArrayType, FloatType
 import numpy as np
 
-# 1. Iniciar sessão Spark
-spark = SparkSession.builder \
-    .appName("GeneralizedSMOTE") \
-    .getOrCreate()
+# Iniciar sessão Spark
+spark = SparkSession.builder.appName("SMOTENumeric").getOrCreate()
 
-# 2. Função para calcular distâncias entre pontos
+# Função UDF para calcular distâncias
 @udf(returnType=ArrayType(FloatType()))
 def calculate_distances(features, all_features):
     point = np.array(features.toArray())
@@ -21,62 +18,62 @@ def calculate_distances(features, all_features):
         distances.append(distance)
     return distances
 
-# 3. Função principal para gerar amostras sintéticas
-def generate_synthetic_samples(spark_df, target_col, numeric_cols, categorical_cols=[], k=5, sampling_ratio=1.0):
+# Função UDF para obter vizinhos mais próximos
+@udf(returnType=ArrayType(ArrayType(FloatType())))
+def get_k_neighbors(distances, k):
+    indices = np.argpartition(distances, k)[:k+1]
+    return [[float(i), float(distances[i])] for i in indices if distances[i] > 0]  # Exclui o próprio ponto
+
+# Função principal SMOTE para colunas numéricas
+def smote_numeric(df, target_col, numeric_cols, k=5, sampling_ratio=1.0):
     """
-    Gera amostras sintéticas usando SMOTE para dados no PySpark
+    Gera amostras sintéticas para colunas numéricas usando SMOTE
     
     Args:
-        spark_df: DataFrame Spark com os dados originais
-        target_col: Nome da coluna da variável resposta (string)
-        numeric_cols: Lista de colunas numéricas
-        categorical_cols: Lista de colunas categóricas (opcional)
-        k: Número de vizinhos mais próximos a considerar
-        sampling_ratio: Proporção de oversampling (1.0 = balanceia completamente)
+        df: DataFrame Spark
+        target_col: Nome da coluna target (string)
+        numeric_cols: Lista de colunas numéricas (list)
+        k: Número de vizinhos (int)
+        sampling_ratio: Razão de oversampling (float)
     
     Returns:
-        DataFrame Spark com amostras originais + sintéticas
+        DataFrame balanceado
     """
-    # Filtrar classes
-    class_counts = spark_df.groupBy(target_col).count().collect()
+    # Identificar classes
+    class_counts = df.groupBy(target_col).count().collect()
     minority_label = sorted([(x.count, x[target_col]) for x in class_counts])[0][1]
     majority_label = sorted([(x.count, x[target_col]) for x in class_counts])[1][1]
     
-    minority_df = spark_df.filter(col(target_col) == minority_label)
-    majority_df = spark_df.filter(col(target_col) == majority_label)
+    minority_df = df.filter(col(target_col) == minority_label)
+    majority_df = df.filter(col(target_col) == majority_label)
     
     count_minority = minority_df.count()
     count_majority = majority_df.count()
     
-    # Calcular número de amostras sintéticas necessárias
+    # Calcular número de amostras sintéticas
     num_synthetic = int((count_majority - count_minority) * sampling_ratio)
     if num_synthetic <= 0:
-        return spark_df
+        return df
     
-    # Normalizar features numéricas
-    assembler = VectorAssembler(inputCols=numeric_cols, outputCol="numeric_features")
-    minority_numeric = assembler.transform(minority_df)
+    # Pré-processamento: Normalizar features
+    assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features_vec")
+    minority_vec = assembler.transform(minority_df)
     
-    scaler = MinMaxScaler(inputCol="numeric_features", outputCol="scaled_features")
-    scaler_model = scaler.fit(minority_numeric)
-    minority_scaled = scaler_model.transform(minority_numeric)
+    scaler = MinMaxScaler(inputCol="features_vec", outputCol="scaled_features")
+    scaler_model = scaler.fit(minority_vec)
+    minority_scaled = scaler_model.transform(minority_vec)
     
-    # Coletar features escaladas para cálculo de distância
+    # Coletar pontos para cálculo de distância
     minority_points = minority_scaled.select("scaled_features").collect()
     all_points = [row.scaled_features for row in minority_points]
     
-    # Adicionar distâncias a cada ponto
+    # Calcular distâncias
     minority_with_distances = minority_scaled.withColumn(
-        "distances",
+        "distances", 
         calculate_distances(col("scaled_features"), array([lit(x) for x in all_points]))
     )
     
-    # Encontrar k vizinhos mais próximos para cada ponto
-    @udf(returnType=ArrayType(ArrayType(FloatType())))
-    def get_k_neighbors(distances, k):
-        indices = np.argpartition(distances, k)[:k+1]  # +1 para incluir o próprio ponto
-        return [[float(i), float(distances[i])] for i in indices if i != len(distances)-1]  # Excluir o próprio ponto
-    
+    # Identificar k vizinhos mais próximos
     minority_with_neighbors = minority_with_distances.withColumn(
         "neighbors",
         get_k_neighbors(col("distances"), lit(k))
@@ -86,75 +83,65 @@ def generate_synthetic_samples(spark_df, target_col, numeric_cols, categorical_c
     synthetic_samples = []
     minority_rows = minority_with_neighbors.collect()
     
-    for i, row in enumerate(minority_rows):
+    for i in range(num_synthetic):
+        # Selecionar ponto aleatório da minoria
+        idx = np.random.randint(0, len(minority_rows))
+        row = minority_rows[idx]
+        
         if not row.neighbors:
             continue
             
-        # Escolher um vizinho aleatório
-        neighbor_idx, distance = row.neighbors[np.random.randint(0, len(row.neighbors))]
+        # Selecionar vizinho aleatório
+        neighbor_idx, _ = row.neighbors[np.random.randint(0, len(row.neighbors))]
         neighbor_row = minority_rows[int(neighbor_idx)]
         
-        # Interpolar features numéricas
-        synthetic_numeric = {}
+        # Gerar ponto sintético
+        synthetic_row = {}
         for col_name in numeric_cols:
             original_val = row[col_name]
             neighbor_val = neighbor_row[col_name]
             gap = np.random.random()
             synthetic_val = original_val + gap * (neighbor_val - original_val)
-            synthetic_numeric[col_name] = float(synthetic_val)
+            synthetic_row[col_name] = float(synthetic_val)
         
-        # Manter features categóricas do ponto original
-        synthetic_categ = {col_name: row[col_name] for col_name in categorical_cols}
-        
-        # Criar linha sintética
-        synthetic_row = {**synthetic_numeric, **synthetic_categ, target_col: minority_label}
+        synthetic_row[target_col] = minority_label
         synthetic_samples.append(synthetic_row)
-        
-        if len(synthetic_samples) >= num_synthetic:
-            break
     
-    # Criar DataFrame com amostras sintéticas
+    # Combinar com dados originais
     if synthetic_samples:
         synthetic_df = spark.createDataFrame(synthetic_samples)
-        # Combinar com dados originais
-        return spark_df.unionByName(synthetic_df)
-    else:
-        return spark_df
+        return df.unionByName(synthetic_df)
+    return df
 
-# 4. Exemplo de uso
+# Exemplo de uso
 if __name__ == "__main__":
-    # Criar dados de exemplo
+    # Dados de exemplo
     data = [
-        (1.0, 2.0, "A", 0),
-        (1.5, 1.8, "B", 0),
-        (2.0, 3.0, "A", 0),
-        (3.0, 2.5, "B", 1),
-        (3.5, 2.0, "A", 1),
+        (1.0, 2.0, 0),
+        (1.5, 1.8, 0),
+        (2.0, 3.0, 0),
+        (3.0, 2.5, 1),
+        (3.5, 2.0, 1),
     ]
-    columns = ["feature1", "feature2", "category", "class_label"]  # Note que mudamos o nome da coluna alvo
+    columns = ["feature1", "feature2", "label"]
     df = spark.createDataFrame(data, columns)
     
-    # Definir parâmetros através de variáveis
-    target_variable = "class_label"  # Nome da coluna alvo
-    numerical_features = ["feature1", "feature2"]
-    categorical_features = ["category"]
+    # Parâmetros
+    target_column = "label"
+    numeric_columns = ["feature1", "feature2"]
     
     # Aplicar SMOTE
-    balanced_df = generate_synthetic_samples(
-        spark_df=df,
-        target_col=target_variable,
-        numeric_cols=numerical_features,
-        categorical_cols=categorical_features,
+    balanced_df = smote_numeric(
+        df=df,
+        target_col=target_column,
+        numeric_cols=numeric_columns,
         k=2,
         sampling_ratio=1.0
     )
     
-    # Mostrar resultados
-    print("Contagem original por classe:")
-    df.groupBy(target_variable).count().show()
+    # Resultados
+    print("Distribuição original:")
+    df.groupBy("label").count().show()
     
-    print("Contagem após SMOTE:")
-    balanced_df.groupBy(target_variable).count().show()
-    
-    print("Amostras sintéticas geradas:")
-    balanced_df.filter(col(target_variable) == 1).show()
+    print("Distribuição após SMOTE:")
+    balanced_df.groupBy("label").count().show()
