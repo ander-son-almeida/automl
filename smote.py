@@ -15,6 +15,16 @@ class SmoteConfig:
         self.bucketLength = bucketLength  # parâmetro para LSH
         self.seed = seed  # semente para reprodutibilidade
 
+from pyspark.sql import DataFrame
+from pyspark.ml.feature import VectorAssembler, StringIndexer, BucketedRandomProjectionLSH
+from pyspark.ml import Pipeline
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.linalg import VectorUDT
+import random
+from functools import reduce
+from typing import List, Optional
+
 class SmoteConfig:
     def __init__(self, k=5, multiplier=1, bucketLength=2.0, seed=42):
         self.k = k
@@ -22,10 +32,11 @@ class SmoteConfig:
         self.bucketLength = bucketLength
         self.seed = seed
 
-def smote_spark(df: DataFrame, target_col: str, num_cols: List[str], 
-                cat_cols: Optional[List[str]] = None, config: Optional[SmoteConfig] = None) -> DataFrame:
+def smote_spark_dropna(df: DataFrame, target_col: str, num_cols: List[str], 
+                      cat_cols: Optional[List[str]] = None, 
+                      config: Optional[SmoteConfig] = None) -> DataFrame:
     """
-    Aplica SMOTE tratando valores NaN e evitando ambiguidade de colunas.
+    Aplica SMOTE removendo linhas com NaN e evitando ambiguidade de colunas.
     
     Args:
         df: DataFrame Spark
@@ -35,7 +46,7 @@ def smote_spark(df: DataFrame, target_col: str, num_cols: List[str],
         config: Configurações do SMOTE
         
     Returns:
-        DataFrame balanceado
+        DataFrame balanceado sem NaN
     """
     if cat_cols is None:
         cat_cols = []
@@ -43,40 +54,35 @@ def smote_spark(df: DataFrame, target_col: str, num_cols: List[str],
     if config is None:
         config = SmoteConfig()
     
-    # Verificação da coluna alvo
-    distinct_values = [row[target_col] for row in df.select(target_col).distinct().collect()]
-    if len(distinct_values) != 2:
-        raise ValueError("A coluna alvo deve ter exatamente 2 valores distintos")
+    # 1. Remover linhas com NaN em qualquer coluna usada no SMOTE
+    non_null_df = df.dropna(subset=num_cols + cat_cols + [target_col])
     
-    # Pré-processamento com tratamento de NaN
-    processed_df = _preprocess_with_nan_handling(df, num_cols, cat_cols, target_col)
+    # 2. Pré-processamento sem NaN
+    processed_df = _preprocess_dropna(non_null_df, num_cols, cat_cols, target_col)
     
-    # Aplicar SMOTE com verificação de ambiguidade
-    oversampled_df = _apply_smote_safe(processed_df, config)
+    # 3. Aplicar SMOTE seguro
+    oversampled_df = _apply_smote_dropna(processed_df, config)
     
     return oversampled_df
 
-def _preprocess_with_nan_handling(df: DataFrame, num_cols: List[str], 
-                                 cat_cols: List[str], target_col: str) -> DataFrame:
-    """Pré-processamento com tratamento de valores faltantes."""
-    # 1. Tratar valores NaN nas colunas numéricas
-    imputer = Imputer(inputCols=num_cols, outputCols=num_cols, strategy="mean")
-    
-    # 2. Indexar colunas categóricas (exceto target)
+def _preprocess_dropna(df: DataFrame, num_cols: List[str], 
+                      cat_cols: List[str], target_col: str) -> DataFrame:
+    """Pré-processamento removendo NaN e preparando colunas."""
+    # Indexar colunas categóricas (exceto target)
     indexers = [
         StringIndexer(inputCol=col, outputCol=f"{col}_index").fit(df) 
         for col in cat_cols 
         if col != target_col
     ]
     
-    # 3. Assembler para colunas numéricas (com nome único para features)
+    # Assembler para colunas numéricas (com nome único)
     assembler = VectorAssembler(inputCols=num_cols, outputCol="smote_features")
     
-    # Pipeline com imputação, indexação e assembler
-    pipeline = Pipeline(stages=[imputer] + indexers + [assembler])
+    # Pipeline
+    pipeline = Pipeline(stages=indexers + [assembler])
     transformed_df = pipeline.fit(df).transform(df)
     
-    # Selecionar e renomear colunas para evitar ambiguidade
+    # Selecionar colunas mantendo apenas as necessárias
     keep_cols = [
         col for col in transformed_df.columns 
         if col not in num_cols + cat_cols
@@ -84,10 +90,10 @@ def _preprocess_with_nan_handling(df: DataFrame, num_cols: List[str],
     
     return transformed_df.select(*keep_cols).withColumnRenamed(target_col, "label")
 
-def _apply_smote_safe(df: DataFrame, config: SmoteConfig) -> DataFrame:
-    """Aplica SMOTE com verificação de ambiguidade."""
-    # Renomear a coluna de features para evitar conflitos
-    working_df = df.withColumnRenamed("smote_features", "features")
+def _apply_smote_dropna(df: DataFrame, config: SmoteConfig) -> DataFrame:
+    """Aplica SMOTE garantindo uso apenas de dados completos."""
+    # Garantir nome único para features
+    working_df = df.withColumnRenamed("smote_features", "features_for_smote")
     
     # Separar classes
     df_min = working_df.filter(F.col("label") == 1)
@@ -96,27 +102,27 @@ def _apply_smote_safe(df: DataFrame, config: SmoteConfig) -> DataFrame:
     if df_min.count() == 0:
         return df.drop("smote_features")
     
-    # Configurar LSH com nome explícito da coluna
+    # Configurar LSH
     brp = BucketedRandomProjectionLSH(
-        inputCol="features",
+        inputCol="features_for_smote",
         outputCol="hashes",
         seed=config.seed,
         bucketLength=config.bucketLength
     )
     
-    # Ajustar modelo garantindo que só há uma coluna "features"
-    model = brp.fit(df_min.select("features", *[c for c in df_min.columns if c != "features"]))
+    # Ajustar modelo apenas com dados completos
+    model = brp.fit(df_min.select("features_for_smote", *[c for c in df_min.columns if c != "features_for_smote"]))
     
-    # Similaridade com nomes explícitos
+    # Similaridade com aliases explícitos
     self_join = model.approxSimilarityJoin(
-        df_min.alias("minA"), 
-        df_min.alias("minB"), 
+        df_min.alias("min_clean_A"), 
+        df_min.alias("min_clean_B"), 
         float("inf"), 
         distCol="EuclideanDistance"
     ).filter("EuclideanDistance > 0")
     
     # Selecionar k vizinhos mais próximos
-    window = Window.partitionBy("minA").orderBy("EuclideanDistance")
+    window = Window.partitionBy("min_clean_A").orderBy("EuclideanDistance")
     neighbors_df = self_join.withColumn("rn", F.row_number().over(window)) \
                           .filter(F.col("rn") <= config.k) \
                           .drop("rn")
@@ -126,24 +132,24 @@ def _apply_smote_safe(df: DataFrame, config: SmoteConfig) -> DataFrame:
     subtract_udf = F.udf(lambda arr: random.uniform(0, 1) * (arr[0] - arr[1]), VectorUDT())
     add_udf = F.udf(lambda arr: arr[0] + arr[1], VectorUDT())
     
-    original_cols = [col for col in df_min.columns if col != "features"]
+    original_cols = [col for col in df_min.columns if col != "features_for_smote"]
     
     for _ in range(config.multiplier):
         # Selecionar vizinho aleatório
         rand_df = neighbors_df.withColumn("rand", F.rand(seed=config.seed))
-        max_rand_df = rand_df.withColumn("max_rand", F.max("rand").over(Window.partitionBy("minA")))
+        max_rand_df = rand_df.withColumn("max_rand", F.max("rand").over(Window.partitionBy("min_clean_A")))
         selected_df = max_rand_df.filter(F.col("rand") == F.col("max_rand")).drop("rand", "max_rand")
         
         # Criar features sintéticas
-        diff_df = selected_df.select("*", subtract_udf(F.array("minA.features", "minB.features")).alias("diff"))
-        synth_df = diff_df.select("*", add_udf(F.array("minA.features", "diff")).alias("features"))
+        diff_df = selected_df.select("*", subtract_udf(F.array("min_clean_A.features_for_smote", "min_clean_B.features_for_smote")).alias("diff"))
+        synth_df = diff_df.select("*", add_udf(F.array("min_clean_A.features_for_smote", "diff")).alias("features_for_smote"))
         
-        # Copiar outras colunas
+        # Copiar outras colunas (50% de chance para original/vizinho)
         for col_name in original_cols:
-            choice = random.choice(["minA", "minB"])
+            choice = random.choice(["min_clean_A", "min_clean_B"])
             synth_df = synth_df.withColumn(col_name, F.col(f"{choice}.{col_name}"))
         
-        synth_df = synth_df.drop("minA", "minB", "diff", "EuclideanDistance")
+        synth_df = synth_df.drop("min_clean_A", "min_clean_B", "diff", "EuclideanDistance")
         synthetic_data.append(synth_df)
     
     # Combinar resultados
@@ -153,7 +159,7 @@ def _apply_smote_safe(df: DataFrame, config: SmoteConfig) -> DataFrame:
     else:
         result = working_df
     
-    return result.drop("features").withColumnRenamed("smote_features", "features")
+    return result.drop("features_for_smote").withColumnRenamed("smote_features", "features")
 
 
 # Exemplo de uso:
