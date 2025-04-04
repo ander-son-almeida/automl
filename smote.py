@@ -138,3 +138,39 @@ def _apply_smote(df: DataFrame, config: SmoteConfig) -> DataFrame:
         return df_maj.unionByName(df_min).unionByName(all_synthetic)
     else:
         return df
+
+
+# Exemplo de uso:
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("SMOTE_Example").getOrCreate()
+
+# 1. Crie seu DataFrame Spark (df)
+# 2. Defina quais colunas são numéricas e categóricas
+num_cols = ["idade", "renda", "valor_emprestimo"]  # substitua com suas colunas numéricas
+cat_cols = ["estado_civil", "escolaridade"]       # substitua com suas colunas categóricas
+target_col = "inadimplente"                       # substitua com sua coluna alvo (1 = classe minoritária)
+
+# 3. (Opcional) Configure os parâmetros do SMOTE
+smote_config = SmoteConfig(
+    k=5,           # número de vizinhos mais próximos
+    multiplier=2,   # quantas vezes replicar os dados sintéticos
+    bucketLength=2, # parâmetro para LSH
+    seed=42         # semente para reprodutibilidade
+)
+
+# 4. Aplique SMOTE
+df_balanced = smote_spark(
+    df=df,
+    target_col=target_col,
+    num_cols=num_cols,
+    cat_cols=cat_cols,
+    config=smote_config
+)
+
+# 5. Mostre o resultado
+print("Antes do SMOTE:")
+df.groupBy(target_col).count().show()
+
+print("Depois do SMOTE:")
+df_balanced.groupBy("label").count().show()
