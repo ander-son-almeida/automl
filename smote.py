@@ -15,19 +15,27 @@ class SmoteConfig:
         self.bucketLength = bucketLength  # parâmetro para LSH
         self.seed = seed  # semente para reprodutibilidade
 
-def smote_spark(df: DataFrame, target_col: str, num_cols: List[str], cat_cols: List[str] = None, config: SmoteConfig = None) -> DataFrame:
+class SmoteConfig:
+    def __init__(self, k=5, multiplier=1, bucketLength=2.0, seed=42):
+        self.k = k
+        self.multiplier = multiplier
+        self.bucketLength = bucketLength
+        self.seed = seed
+
+def smote_spark(df: DataFrame, target_col: str, num_cols: List[str], 
+                cat_cols: Optional[List[str]] = None, config: Optional[SmoteConfig] = None) -> DataFrame:
     """
-    Aplica SMOTE para oversampling da classe minoritária em um DataFrame Spark.
+    Aplica SMOTE tratando valores NaN e evitando ambiguidade de colunas.
     
     Args:
-        df: DataFrame Spark contendo os dados
+        df: DataFrame Spark
         target_col: Nome da coluna alvo binária (1 = classe minoritária)
         num_cols: Lista de colunas numéricas
-        cat_cols: Lista de colunas categóricas (opcional)
-        config: Configurações do SMOTE (opcional)
+        cat_cols: Lista de colunas categóricas
+        config: Configurações do SMOTE
         
     Returns:
-        DataFrame Spark com oversampling aplicado
+        DataFrame balanceado
     """
     if cat_cols is None:
         cat_cols = []
@@ -35,109 +43,117 @@ def smote_spark(df: DataFrame, target_col: str, num_cols: List[str], cat_cols: L
     if config is None:
         config = SmoteConfig()
     
-    # Verifica se a coluna alvo é binária
-    distinct_values = df.select(target_col).distinct().collect()
+    # Verificação da coluna alvo
+    distinct_values = [row[target_col] for row in df.select(target_col).distinct().collect()]
     if len(distinct_values) != 2:
         raise ValueError("A coluna alvo deve ter exatamente 2 valores distintos")
     
-    # Pré-processamento: preparar os dados para SMOTE
-    processed_df = _preprocess_for_smote(df, num_cols, cat_cols, target_col)
+    # Pré-processamento com tratamento de NaN
+    processed_df = _preprocess_with_nan_handling(df, num_cols, cat_cols, target_col)
     
-    # Aplicar SMOTE
-    oversampled_df = _apply_smote(processed_df, config)
+    # Aplicar SMOTE com verificação de ambiguidade
+    oversampled_df = _apply_smote_safe(processed_df, config)
     
     return oversampled_df
 
-def _preprocess_for_smote(df: DataFrame, num_cols: List[str], cat_cols: List[str], target_col: str) -> DataFrame:
-    """Prepara o DataFrame para SMOTE."""
-    # Remove a target_col das num_cols se estiver presente
-    if target_col in num_cols:
-        num_cols.remove(target_col)
+def _preprocess_with_nan_handling(df: DataFrame, num_cols: List[str], 
+                                 cat_cols: List[str], target_col: str) -> DataFrame:
+    """Pré-processamento com tratamento de valores faltantes."""
+    # 1. Tratar valores NaN nas colunas numéricas
+    imputer = Imputer(inputCols=num_cols, outputCols=num_cols, strategy="mean")
     
-    # Indexador para colunas categóricas (exceto target)
+    # 2. Indexar colunas categóricas (exceto target)
     indexers = [
         StringIndexer(inputCol=col, outputCol=f"{col}_index").fit(df) 
         for col in cat_cols 
         if col != target_col
     ]
     
-    # Assembler para colunas numéricas
-    assembler = VectorAssembler(inputCols=num_cols, outputCol="features")
+    # 3. Assembler para colunas numéricas (com nome único para features)
+    assembler = VectorAssembler(inputCols=num_cols, outputCol="smote_features")
     
-    # Pipeline de transformação
-    pipeline = Pipeline(stages=indexers + [assembler])
+    # Pipeline com imputação, indexação e assembler
+    pipeline = Pipeline(stages=[imputer] + indexers + [assembler])
     transformed_df = pipeline.fit(df).transform(df)
     
-    # Seleciona apenas colunas necessárias e renomeia target_col para "label"
-    keep_cols = [col for col in transformed_df.columns 
-                if col not in num_cols + cat_cols] + ["features"]
+    # Selecionar e renomear colunas para evitar ambiguidade
+    keep_cols = [
+        col for col in transformed_df.columns 
+        if col not in num_cols + cat_cols
+    ] + ["smote_features"]
     
     return transformed_df.select(*keep_cols).withColumnRenamed(target_col, "label")
 
-def _apply_smote(df: DataFrame, config: SmoteConfig) -> DataFrame:
-    """Aplica o algoritmo SMOTE ao DataFrame preparado."""
-    # Separa classes minoritária (1) e majoritária (0)
-    df_min = df.filter(F.col("label") == 1)
-    df_maj = df.filter(F.col("label") == 0)
+def _apply_smote_safe(df: DataFrame, config: SmoteConfig) -> DataFrame:
+    """Aplica SMOTE com verificação de ambiguidade."""
+    # Renomear a coluna de features para evitar conflitos
+    working_df = df.withColumnRenamed("smote_features", "features")
     
-    # Se não há instâncias minoritárias, retorna o original
+    # Separar classes
+    df_min = working_df.filter(F.col("label") == 1)
+    df_maj = working_df.filter(F.col("label") == 0)
+    
     if df_min.count() == 0:
-        return df
+        return df.drop("smote_features")
     
-    # Aplica LSH para encontrar vizinhos mais próximos
+    # Configurar LSH com nome explícito da coluna
     brp = BucketedRandomProjectionLSH(
         inputCol="features",
         outputCol="hashes",
         seed=config.seed,
         bucketLength=config.bucketLength
     )
-    model = brp.fit(df_min)
     
-    # Encontra k vizinhos mais próximos para cada ponto
+    # Ajustar modelo garantindo que só há uma coluna "features"
+    model = brp.fit(df_min.select("features", *[c for c in df_min.columns if c != "features"]))
+    
+    # Similaridade com nomes explícitos
     self_join = model.approxSimilarityJoin(
-        df_min, df_min, float("inf"), distCol="EuclideanDistance"
-    ).filter("EuclideanDistance > 0")  # remove auto-comparações
+        df_min.alias("minA"), 
+        df_min.alias("minB"), 
+        float("inf"), 
+        distCol="EuclideanDistance"
+    ).filter("EuclideanDistance > 0")
     
-    # Ordena por distância e seleciona os k mais próximos
-    window = Window.partitionBy("datasetA").orderBy("EuclideanDistance")
+    # Selecionar k vizinhos mais próximos
+    window = Window.partitionBy("minA").orderBy("EuclideanDistance")
     neighbors_df = self_join.withColumn("rn", F.row_number().over(window)) \
                           .filter(F.col("rn") <= config.k) \
                           .drop("rn")
     
-    # Gera dados sintéticos
+    # Gerar dados sintéticos
     synthetic_data = []
-    
-    # UDFs para operações vetoriais
     subtract_udf = F.udf(lambda arr: random.uniform(0, 1) * (arr[0] - arr[1]), VectorUDT())
     add_udf = F.udf(lambda arr: arr[0] + arr[1], VectorUDT())
     
     original_cols = [col for col in df_min.columns if col != "features"]
     
     for _ in range(config.multiplier):
-        # Seleciona vizinho aleatório para cada ponto
+        # Selecionar vizinho aleatório
         rand_df = neighbors_df.withColumn("rand", F.rand(seed=config.seed))
-        max_rand_df = rand_df.withColumn("max_rand", F.max("rand").over(Window.partitionBy("datasetA")))
+        max_rand_df = rand_df.withColumn("max_rand", F.max("rand").over(Window.partitionBy("minA")))
         selected_df = max_rand_df.filter(F.col("rand") == F.col("max_rand")).drop("rand", "max_rand")
         
-        # Cria features sintéticas
-        diff_df = selected_df.select("*", subtract_udf(F.array("datasetA.features", "datasetB.features")).alias("diff"))
-        synth_df = diff_df.select("*", add_udf(F.array("datasetA.features", "diff")).alias("features"))
+        # Criar features sintéticas
+        diff_df = selected_df.select("*", subtract_udf(F.array("minA.features", "minB.features")).alias("diff"))
+        synth_df = diff_df.select("*", add_udf(F.array("minA.features", "diff")).alias("features"))
         
-        # Copia outras colunas (aleatoriamente do original ou vizinho)
+        # Copiar outras colunas
         for col_name in original_cols:
-            choice = random.choice(["datasetA", "datasetB"])
+            choice = random.choice(["minA", "minB"])
             synth_df = synth_df.withColumn(col_name, F.col(f"{choice}.{col_name}"))
         
-        synth_df = synth_df.drop("datasetA", "datasetB", "diff", "EuclideanDistance")
+        synth_df = synth_df.drop("minA", "minB", "diff", "EuclideanDistance")
         synthetic_data.append(synth_df)
     
-    # Combina todos os dados sintéticos
+    # Combinar resultados
     if synthetic_data:
         all_synthetic = reduce(DataFrame.unionAll, synthetic_data)
-        # Retorna dados originais + sintéticos
-        return df_maj.unionByName(df_min).unionByName(all_synthetic)
+        result = df_maj.unionByName(df_min).unionByName(all_synthetic)
     else:
-        return df
+        result = working_df
+    
+    return result.drop("features").withColumnRenamed("smote_features", "features")
 
 
 # Exemplo de uso:
