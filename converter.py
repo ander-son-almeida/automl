@@ -372,7 +372,64 @@ class ModelEvaluator:
         plt.title(f'Distribuição de Probabilidades - {self.model_name}\nKS = {ks_stat:.3f}')
         plt.legend()
         plt.show()
+def plot_ks_curve(self):
+    """Plota o gráfico KS com as curvas acumuladas e destaca a maior distância"""
+    if self.probabilities is None:
+        print("Modelo não suporta probabilidades. Não é possível plotar KS.")
+        return
     
+    # Ordena as probabilidades e cria curvas acumuladas
+    df = pd.DataFrame({'prob': self.probabilities, 'target': self.y_test})
+    df = df.sort_values('prob', ascending=False).reset_index(drop=True)
+    
+    # Cria curvas cumulativas
+    df['cumulative_pos'] = df['target'].cumsum() / df['target'].sum()
+    df['cumulative_neg'] = (1 - df['target']).cumsum() / (1 - df['target']).sum()
+    df['ks'] = df['cumulative_pos'] - df['cumulative_neg']
+    
+    # Encontra o ponto de máxima distância (KS)
+    max_ks_idx = df['ks'].idxmax()
+    max_ks = df.loc[max_ks_idx, 'ks']
+    ks_threshold = df.loc[max_ks_idx, 'prob']
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plota as curvas cumulativas
+    plt.plot(df['prob'], df['cumulative_pos'], label='Verdadeiros Positivos (Sensitivity)', color='blue')
+    plt.plot(df['prob'], df['cumulative_neg'], label='Falsos Positivos (1 - Specificity)', color='red')
+    
+    # Linha vertical no ponto KS
+    plt.axvline(x=ks_threshold, color='green', linestyle='--', 
+               label=f'Ponto KS (Limiar={ks_threshold:.2f})')
+    
+    # Linha horizontal conectando as curvas no ponto KS
+    plt.plot([ks_threshold, ks_threshold], 
+             [df.loc[max_ks_idx, 'cumulative_neg'], df.loc[max_ks_idx, 'cumulative_pos']], 
+             color='black', linewidth=2, linestyle='-')
+    
+    # Anotação com valor KS
+    plt.annotate(f'KS = {max_ks:.3f}', 
+                xy=(ks_threshold, df.loc[max_ks_idx, 'cumulative_neg'] + max_ks/2),
+                xytext=(10, 10), textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5),
+                arrowprops=dict(arrowstyle='->'))
+    
+    # Configurações do gráfico
+    plt.title(f'Gráfico Kolmogorov-Smirnov (KS) - {self.model_name}\nKS = {max_ks:.3f} no limiar {ks_threshold:.3f}')
+    plt.xlabel('Probabilidade Prevista (Ordenada Decrescente)')
+    plt.ylabel('Taxa Cumulativa')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    
+    # Adiciona informações adicionais
+    plt.text(0.05, 0.8, 
+             f'KS: {max_ks:.3f}\nLimiar: {ks_threshold:.3f}\n\n'
+             f'Sensibilidade: {df.loc[max_ks_idx, "cumulative_pos"]:.1%}\n'
+             f'1-Especif.: {df.loc[max_ks_idx, "cumulative_neg"]:.1%}',
+             bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.show()
+  
     def plot_feature_importance(self):
         """Plota a importância das features"""
         if hasattr(self.model, 'feature_importances_'):
