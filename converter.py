@@ -346,19 +346,30 @@ class ModelEvaluator:
         plt.show()
     
     def plot_probability_distribution(self):
-        """Plota a distribuição de probabilidades"""
+        """Plota a distribuição de probabilidades com KS"""
         if self.probabilities is None:
             print("Modelo não suporta probabilidades. Não é possível plotar distribuição.")
             return
         
-        plt.figure(figsize=(8, 6))
-        plt.hist(self.probabilities[self.y_test == 0], bins=30, alpha=0.5, 
-                label='Negativo', color='red')
-        plt.hist(self.probabilities[self.y_test == 1], bins=30, alpha=0.5, 
-                label='Positivo', color='green')
+        # Calcula estatística KS
+        pos_probs = self.probabilities[self.y_test == 1]
+        neg_probs = self.probabilities[self.y_test == 0]
+        ks_stat = np.max(np.abs(np.linspace(0, 1, len(pos_probs)) - np.sort(pos_probs)))
+        
+        plt.figure(figsize=(12, 8))
+        plt.hist(pos_probs, bins=30, alpha=0.5, 
+                label=f'Positivo (n={len(pos_probs)})', color='green')
+        plt.hist(neg_probs, bins=30, alpha=0.5, 
+                label=f'Negativo (n={len(neg_probs)})', color='red')
+        
+        # Adiciona linha do KS
+        ks_x = np.argmax(np.abs(np.cumsum(pos_probs) - np.cumsum(neg_probs)))
+        plt.axvline(x=ks_x/len(self.probabilities), color='blue', 
+                   linestyle='--', label=f'KS = {ks_stat:.3f}')
+        
         plt.xlabel('Probabilidade Prevista')
         plt.ylabel('Frequência')
-        plt.title(f'Distribuição de Probabilidades - {self.model_name}')
+        plt.title(f'Distribuição de Probabilidades - {self.model_name}\nKS = {ks_stat:.3f}')
         plt.legend()
         plt.show()
     
