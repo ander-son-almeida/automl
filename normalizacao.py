@@ -8,65 +8,59 @@ from pyspark.ml.classification import (
 from sparkdl.xgboost import XGBoostClassifier
 from synapse.ml.lightgbm import LightGBMClassifier
 
-# Primeiro, tratar valores missing (preencher com zero)
+# 1. Tratar missing values (preencher com zero)
 dataset = dataset.fillna(0)
 
-# Criar o vetor de features (já com missing tratados)
+# 2. Criar pipeline de preparação
 assembler = VectorAssembler(inputCols=features_cols, outputCol="features_raw")
-
-# Criar o scaler para normalização
 scaler = StandardScaler(inputCol="features_raw", outputCol="features", 
-                        withStd=True, withMean=True)
+                       withStd=True, withMean=True)
 
-# Pipeline para preparação dos dados
 prep_pipeline = Pipeline(stages=[assembler, scaler])
 prep_model = prep_pipeline.fit(dataset)
+
+# 3. Criar versões normalizada e original do dataset
 dataset_normalized = prep_model.transform(dataset)
+dataset_original = dataset_normalized.withColumn("features", dataset_normalized["features_raw"])
 
-# Para modelos que não precisam de normalização, usar o dataset original
-dataset_original = prep_pipeline.fit(dataset).transform(dataset)
-dataset_original = dataset_original.withColumn("features", dataset_original["features_raw"])
-
+# 4. Lista de modelos (nomes originais)
 models = [
-    # Modelos que usam dados normalizados
     ("LogisticRegression", LogisticRegression(featuresCol='features', labelCol=variavel_resposta)),
+    ("DecisionTreeClassifier", DecisionTreeClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
+    ("RandomForestClassifier", RandomForestClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
+    ("GBTClassifier", GBTClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
     ("LinearSVC", LinearSVC(featuresCol='features', labelCol=variavel_resposta)),
+    ("NaiveBayes", NaiveBayes(featuresCol='features', labelCol=variavel_resposta)),
     ("MultilayerPerceptronClassifier", MultilayerPerceptronClassifier(
-        featuresCol='features', 
-        labelCol=variavel_resposta, 
-        layers=[len(features_cols), 5, 2], 
-        seed=seed)),
+        featuresCol='features', labelCol=variavel_resposta, layers=[len(features_cols), 5, 2], seed=seed)),
     ("FMClassifier", FMClassifier(featuresCol='features', labelCol=variavel_resposta)),
-    ("OneVsRest", OneVsRest(classifier=LogisticRegression(featuresCol='features', labelCol=variavel_resposta))),
-    
-    # Modelos que usam dados originais (não normalizados)
-    ("DecisionTreeClassifier_original", DecisionTreeClassifier(
-        featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("RandomForestClassifier_original", RandomForestClassifier(
-        featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("GBTClassifier_original", GBTClassifier(
-        featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("NaiveBayes_original", NaiveBayes(
-        featuresCol='features', labelCol=variavel_resposta)),
-    ("LightGBMClassifier_original", LightGBMClassifier(
+    ("LightGBMClassifier", LightGBMClassifier(
         featuresCol='features', labelCol=variavel_resposta, predictionCol="prediction", seed=seed)),
-    ("XGBoostClassifier_original", XGBoostClassifier(
-        featuresCol='features', labelCol=variavel_resposta, seed=seed))
+    ("XGBoostClassifier", XGBoostClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
+    ("OneVsRest", OneVsRest(classifier=LogisticRegression(featuresCol='features', labelCol=variavel_resposta)))
 ]
 
-# Agora no loop de avaliação você precisará usar o dataset apropriado para cada modelo
+# 5. Lista de modelos que DEVEM usar dados normalizados
+models_using_normalized = [
+    "LogisticRegression",
+    "LinearSVC",
+    "MultilayerPerceptronClassifier",
+    "FMClassifier",
+    "OneVsRest"
+]
+
+# 6. Loop de treinamento
 for model_name, model in models:
     try:
-        if "_original" in model_name:
-            # Usar dataset original para modelos que não precisam de normalização
-            fitted_model = model.fit(dataset_original)
-            predictions = fitted_model.transform(dataset_original)
-        else:
-            # Usar dataset normalizado para outros modelos
-            fitted_model = model.fit(dataset_normalized)
-            predictions = fitted_model.transform(dataset_normalized)
+        # Decide qual dataset usar
+        current_df = dataset_normalized if model_name in models_using_normalized else dataset_original
+        
+        # Treina o modelo
+        fitted_model = model.fit(current_df)
+        predictions = fitted_model.transform(current_df)
         
         # Avaliação do modelo aqui...
+        print(f"Modelo {model_name} treinado com sucesso")
         
     except Exception as e:
         print(f"Erro ao treinar {model_name}: {str(e)}")
