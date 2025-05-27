@@ -1,92 +1,107 @@
 from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml import Pipeline
-from pyspark.ml.classification import *
-from pyspark.sql.functions import col
+from pyspark.ml.classification import (
+    LogisticRegression,
+    DecisionTreeClassifier,
+    RandomForestClassifier,
+    GBTClassifier,
+    LinearSVC,
+    MultilayerPerceptronClassifier,
+    FMClassifier
+)
 from synapse.ml.lightgbm import LightGBMClassifier
 from sparkdl.xgboost import XGBoostClassifier
+from pyspark.sql.functions import col
 
 # 1. Configurações iniciais
 seed = 42
-variavel_resposta = "target"
+target_col = "target"
 features_cols = ["col1", "col2", "col3"]  # Substitua pelas suas colunas de features
 
-# 2. Carregar dados
-df_dev = spark.table("dados_desenvolvimento")  # Seu DataFrame de desenvolvimento
-df_oot = spark.table("dados_oot")             # Seu DataFrame OOT (Out-of-Time)
+# 2. Carregar e preparar dados
+df_dev = spark.table("dados_desenvolvimento").fillna(0)
+df_oot = spark.table("dados_oot").fillna(0)
 
-# 3. Tratar missing values (preencher com zero)
-df_dev = df_dev.fillna(0)
-df_oot = df_oot.fillna(0)
-
-# 4. Pipeline de preparação de dados
+# 3. Pipeline de transformação
 assembler = VectorAssembler(inputCols=features_cols, outputCol="features_raw")
-scaler = StandardScaler(inputCol="features_raw", outputCol="features", withStd=True, withMean=True)
-prep_pipeline = Pipeline(stages=[assembler, scaler])
+scaler = StandardScaler(inputCol="features_raw", outputCol="features_scaled")
+pipeline = Pipeline(stages=[assembler, scaler]).fit(df_dev)
 
-# 5. Treinar pipeline apenas nos dados de desenvolvimento
-prep_model = prep_pipeline.fit(df_dev)
+# 4. Criar DataFrames transformados
+def prepare_data(df):
+    df_transformed = pipeline.transform(df)
+    df_normalized = df_transformed.withColumnRenamed("features_scaled", "features")
+    df_original = df_transformed.withColumn("features", col("features_raw"))
+    return df_normalized, df_original
 
-# 6. Aplicar transformações em todos os datasets
-df_dev_prep = prep_model.transform(df_dev)
-df_oot_prep = prep_model.transform(df_oot)
+# Dados de desenvolvimento
+train_norm, train_orig = prepare_data(df_dev)
+test_norm, test_orig = prepare_data(df_dev)  # Nota: na prática faça o split corretamente
 
-# 7. Criar versões originais (não normalizadas)
-df_dev_original = df_dev_prep.withColumn("features", col("features_raw"))
-df_oot_original = df_oot_prep.withColumn("features", col("features_raw"))
+# Dados OOT
+oot_norm, oot_orig = prepare_data(df_oot)
 
-# 8. Split para treino/teste (apenas dados de desenvolvimento)
-train_data, test_data = df_dev_prep.randomSplit([0.8, 0.2], seed=seed)
-
-# 9. Lista de modelos
+# 5. Lista completa de modelos
 models = [
-    ("LogisticRegression", LogisticRegression(featuresCol='features', labelCol=variavel_resposta)),
-    ("DecisionTree", DecisionTreeClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("RandomForest", RandomForestClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("GBT", GBTClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("LinearSVC", LinearSVC(featuresCol='features', labelCol=variavel_resposta)),
-    ("MultilayerPerceptron", MultilayerPerceptronClassifier(
-        featuresCol='features', labelCol=variavel_resposta, 
-        layers=[len(features_cols), 5, 2], seed=seed)),
-    ("FMClassifier", FMClassifier(featuresCol='features', labelCol=variavel_resposta)),
-    ("LightGBM", LightGBMClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed)),
-    ("XGBoost", XGBoostClassifier(featuresCol='features', labelCol=variavel_resposta, seed=seed))
+    ("LogisticRegression", LogisticRegression(featuresCol="features", labelCol=target_col)),
+    ("DecisionTreeClassifier", DecisionTreeClassifier(featuresCol="features", labelCol=target_col, seed=seed)),
+    ("RandomForestClassifier", RandomForestClassifier(featuresCol="features", labelCol=target_col, seed=seed)),
+    ("GBTClassifier", GBTClassifier(featuresCol="features", labelCol=target_col, seed=seed)),
+    ("LinearSVC", LinearSVC(featuresCol="features", labelCol=target_col)),
+    ("MultilayerPerceptronClassifier", MultilayerPerceptronClassifier(
+        featuresCol="features", 
+        labelCol=target_col,
+        layers=[len(features_cols), 5, 2],  # Ajuste conforme necessário
+        seed=seed
+    )),
+    ("FMClassifier", FMClassifier(featuresCol="features", labelCol=target_col)),
+    ("LightGBMClassifier", LightGBMClassifier(featuresCol="features", labelCol=target_col, seed=seed)),
+    ("XGBoostClassifier", XGBoostClassifier(featuresCol="features", labelCol=target_col, seed=seed))
 ]
 
-# 10. Modelos que usam dados normalizados
-normalized_models = [
-    "LogisticRegression",
-    "LinearSVC",
-    "MultilayerPerceptron",
-    "FMClassifier"
-]
+# 6. Mapeamento de modelos para datasets
+model_data_mapping = {
+    "LogisticRegression": "normalized",
+    "DecisionTreeClassifier": "original",
+    "RandomForestClassifier": "original",
+    "GBTClassifier": "original",
+    "LinearSVC": "normalized",
+    "MultilayerPerceptronClassifier": "normalized",
+    "FMClassifier": "normalized",
+    "LightGBMClassifier": "original",
+    "XGBoostClassifier": "original"
+}
 
-# 11. Loop de treinamento e avaliação
+# 7. Função de avaliação
+def evaluate_model(model, train_df, test_df, oot_df):
+    # Treinar
+    fitted_model = model.fit(train_df.select("features", target_col))
+    
+    # Avaliar
+    for data, data_type in [(test_df, "Teste"), (oot_df, "OOT")]:
+        predictions = fitted_model.transform(data.select("features", target_col))
+        print(f"\nAvaliação {model.__class__.__name__} - {data_type}")
+        # Adicione suas métricas aqui
+        # Exemplo:
+        # evaluator = BinaryClassificationEvaluator(labelCol=target_col)
+        # print(f"AUC: {evaluator.evaluate(predictions):.4f}")
+
+# 8. Treinamento e avaliação
 for model_name, model in models:
     try:
-        # Selecionar dataset apropriado
-        if model_name in normalized_models:
-            train_df = train_data.select("features", variavel_resposta)
-            test_df = test_data.select("features", variavel_resposta)
-            oot_df = df_oot_prep.select("features", variavel_resposta)
+        data_type = model_data_mapping[model_name]
+        
+        if data_type == "normalized":
+            train_df = train_norm
+            test_df = test_norm
+            oot_df = oot_norm
         else:
-            train_df = df_dev_original.select("features", variavel_resposta)
-            test_df = df_oot_original.select("features", variavel_resposta)
-            oot_df = df_oot_original.select("features", variavel_resposta)
+            train_df = train_orig
+            test_df = test_orig
+            oot_df = oot_orig
         
-        # Treinar modelo
-        trained_model = model.fit(train_df)
-        
-        # Avaliar nos dados de teste
-        test_predictions = trained_model.transform(test_df)
-        print(f"\nAvaliação {model_name} - Teste:")
-        # Adicione suas métricas de avaliação aqui
-        
-        # Avaliar nos dados OOT
-        oot_predictions = trained_model.transform(oot_df)
-        print(f"\nAvaliação {model_name} - OOT:")
-        # Adicione suas métricas de avaliação aqui
+        print(f"\nTreinando {model_name} com dados {data_type}")
+        evaluate_model(model, train_df, test_df, oot_df)
         
     except Exception as e:
         print(f"\nErro no modelo {model_name}: {str(e)}")
-
-print("\nProcesso de modelagem concluído!")
