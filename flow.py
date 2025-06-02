@@ -23,7 +23,7 @@ def setup_logger(
     console_log: bool = True,
     mlflow_log: bool = True
 ) -> logging.Logger:
-    """Configura logger integrado com MLflow"""
+    """Configura logger que acumula logs e salva no final"""
     logger = logging.getLogger(name)
     
     if logger.hasHandlers():
@@ -42,14 +42,29 @@ def setup_logger(
         logger.addHandler(console_handler)
     
     if mlflow_log:
-        class MLflowLogHandler(logging.Handler):
+        class BufferedMLflowHandler(logging.Handler):
+            """Handler que acumula logs em memória e salva no MLflow ao final"""
+            def __init__(self):
+                super().__init__()
+                self.log_buffer = []
+                
             def emit(self, record):
-                log_entry = self.format(record)
-                mlflow.log_text(log_entry, "execution_log.txt")
+                msg = self.format(record)
+                self.log_buffer.append(msg)
+                
+            def save_to_mlflow(self):
+                """Salva todos os logs acumulados no MLflow"""
+                if self.log_buffer:
+                    full_log = "\n".join(self.log_buffer)
+                    mlflow.log_text(full_log, "execution_log.txt")
         
-        mlflow_handler = MLflowLogHandler()
+        # Cria e configura o handler
+        mlflow_handler = BufferedMLflowHandler()
         mlflow_handler.setFormatter(formatter)
         logger.addHandler(mlflow_handler)
+        
+        # Adiciona referência ao handler para acesso posterior
+        logger.mlflow_handler = mlflow_handler
     
     return logger
 
