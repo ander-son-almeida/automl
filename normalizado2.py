@@ -282,3 +282,14 @@ if __name__ == "__main__":
     
     print("\nRelatório detalhado (sem target):")
     print(relatorio_sem_target)
+
+# Exemplo com parâmetros customizados
+features, relatorio = pipeline_completo_flexivel(
+    df_spark=df,
+    col_data="data_mensal",
+    col_target="target",
+    threshold_missing=0.9,    # Mais rigoroso com missings
+    threshold_moda=0.85,      # Mais rigoroso com moda
+    threshold_correlacao=0.85,# Mais rigoroso com correlação
+    meses_baseline=4          # Baseline maior para PSI
+)
