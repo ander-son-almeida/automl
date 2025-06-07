@@ -1,0 +1,58 @@
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml import Pipeline
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col
+
+def efficient_onehot_encode(df: DataFrame, categorical_cols: list, drop_original=True, drop_last=True) -> DataFrame:
+    """
+    OneHot Encoding otimizado para muitos features categóricos no Spark.
+    
+    Args:
+        df: DataFrame Spark
+        categorical_cols: Lista de colunas categóricas
+        drop_original: Se True, remove colunas originais
+        drop_last: Se True, evita multicolinearidade (útil para modelos lineares)
+    
+    Returns:
+        DataFrame com colunas codificadas
+    """
+    # Etapa 1: StringIndexer em paralelo
+    indexers = [
+        StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid="keep")
+        for col in categorical_cols
+    ]
+    
+    # Etapa 2: OneHotEncoder otimizado
+    encoder = OneHotEncoder(
+        inputCols=[f"{col}_idx" for col in categorical_cols],
+        outputCols=[f"{col}_encoded" for col in categorical_cols],
+        dropLast=drop_last
+    )
+    
+    # Pipeline paralelizado
+    pipeline = Pipeline(stages=indexers + [encoder])
+    
+    # Configurações para melhor performance
+    spark.conf.set("spark.sql.execution.arrow.enabled", "true")
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+    
+    # Aplicar transformações
+    model = pipeline.fit(df)
+    encoded_df = model.transform(df)
+    
+    # Selecionar colunas resultantes
+    original_cols = [c for c in df.columns if c not in categorical_cols]
+    encoded_cols = [f"{col}_encoded" for col in categorical_cols]
+    
+    # Renomear colunas codificadas (removendo sufixo)
+    for col in categorical_cols:
+        encoded_df = encoded_df.withColumnRenamed(f"{col}_encoded", col)
+    
+    # Selecionar apenas colunas necessárias
+    if drop_original:
+        return encoded_df.select(original_cols + categorical_cols)
+    else:
+        return encoded_df.select(original_cols + categorical_cols + [f"{col}_idx" for col in categorical_cols])
+
+# Exemplo de uso:
+# df_encoded = efficient_onehot_encode(df, categorical_cols, drop_last=True)
