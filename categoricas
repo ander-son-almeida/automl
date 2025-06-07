@@ -1,149 +1,114 @@
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.ml.feature import StringIndexer, OneHotEncoder
-from pyspark.ml import Pipeline
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, regexp_replace, when
+from pyspark.sql.types import DoubleType
 
-# 1. Inicializar Spark Session (caso não exista)
-spark = SparkSession.builder \
-    .appName("OptimizedOneHotEncoding") \
-    .getOrCreate()
-
-# 2. Função principal com logging
-def optimized_onehot_encode_with_log(df: DataFrame, 
-                                   categorical_cols: list,
-                                   min_freq: float = 0.01,
-                                   max_categories: int = 50,
-                                   drop_original: bool = True,
-                                   drop_last: bool = True) -> DataFrame:
+def convert_numeric_strings_with_log(df: DataFrame, sample_size: int = 1000) -> DataFrame:
     """
-    OneHot Encoding com redução prévia de cardinalidade e logging informativo.
+    Converte colunas string que contêm números com separadores de milhares para DoubleType,
+    com logging detalhado do processo.
     
     Args:
-        df: DataFrame Spark
-        categorical_cols: Lista de colunas categóricas
-        min_freq: Frequência mínima para manter uma categoria (0-1)
-        max_categories: Número máximo de categorias por coluna
-        drop_original: Se True, remove colunas originais
-        drop_last: Se True, evita multicolinearidade
+        df: DataFrame do Spark
+        sample_size: Número de linhas para amostrar na verificação
     
     Returns:
-        DataFrame com colunas codificadas otimizadas
+        DataFrame com colunas numéricas convertidas
     """
-    # 1. Pré-processamento: Redução de categorias com logging
-    processed_df = df
-    for col in categorical_cols:
-        # Calcular estatísticas iniciais
-        initial_count = df.select(col).distinct().count()
+    print("\nIniciando análise de conversão de colunas numéricas...")
+    
+    # Identificar colunas string candidatas
+    string_cols = [field.name for field in df.schema.fields 
+                  if str(field.dataType) == 'StringType()']
+    print(f"\nTotal de colunas string analisadas: {len(string_cols)}")
+    
+    cols_to_convert = []
+    conversion_details = []
+    
+    for col_name in string_cols:
+        # Amostrar dados para verificar padrões numéricos
+        sample = df.select(col_name).filter(col(col_name).isNotNull()).limit(sample_size).collect()
         
-        # Calcular frequência de cada categoria
-        freq_df = (df.groupBy(col)
-                   .agg(F.count("*").alias("count"))
+        numeric_count = 0
+        total_count = 0
+        example_values = set()
         
-        # Calcular frequência relativa
-        total = df.count()
-        freq_df = freq_df.withColumn("freq", F.col("count")/total)
+        for row in sample:
+            value = row[0]
+            if value is not None:
+                total_count += 1
+                # Verificar padrões numéricos com separadores
+                cleaned_value = value.replace('.', '').replace(',', '').replace('-', '')
+                if cleaned_value.isdigit() and ('.' in value or ',' in value):
+                    numeric_count += 1
+                    if len(example_values) < 3:  # Guardar até 3 exemplos
+                        example_values.add(value)
         
-        # Ordenar por frequência
-        freq_df = freq_df.orderBy(F.desc("count"))
-        
-        # Selecionar top categorias
-        top_categories_df = freq_df.filter(F.col("freq") >= min_freq).limit(max_categories)
-        top_categories = [row[col] for row in top_categories_df.collect()]
-        
-        # Calcular estatísticas após filtro
-        final_count = len(top_categories)
-        kept_percentage = (top_categories_df.agg(F.sum("freq")).collect()[0][0] or 0) * 100
-        
-        # Log de redução
-        print(f"\nColuna '{col}':")
-        print(f"  - Categorias originais: {initial_count}")
-        print(f"  - Categorias mantidas: {final_count}")
-        print(f"  - % dos dados mantidos: {kept_percentage:.2f}%")
-        if initial_count > final_count:
-            print(f"  - Redução de {initial_count - final_count} categorias")
-        
-        # Criar nova coluna com categorias reduzidas
-        processed_df = processed_df.withColumn(
-            f"{col}_reduced",
-            F.when(F.col(col).isin(top_categories), F.col(col))
-             .otherwise(F.lit("__OTHER__"))
-        )
+        # Determinar se deve converter
+        if total_count > 0 and (numeric_count / total_count) > 0.8:
+            cols_to_convert.append(col_name)
+            conversion_details.append({
+                'coluna': col_name,
+                'total': total_count,
+                'numericos': numeric_count,
+                '%_numericos': (numeric_count / total_count) * 100,
+                'exemplos': list(example_values)
+            })
     
-    # 2. Aplicar OneHot Encoding
-    reduced_cols = [f"{col}_reduced" for col in categorical_cols]
+    # Log de colunas detectadas
+    print(f"\nColunas identificadas para conversão ({len(cols_to_convert)}):")
+    for detail in conversion_details:
+        print(f" - {detail['coluna']}:")
+        print(f"   • % valores numéricos: {detail['%_numericos']:.2f}%")
+        print(f"   • Exemplos: {', '.join(detail['exemplos'])}")
     
-    indexers = [
-        StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid="keep")
-        for col in reduced_cols
-    ]
+    # Converter as colunas identificadas
+    converted_count = 0
+    for col_name in cols_to_convert:
+        try:
+            df = df.withColumn(
+                col_name,
+                # Trata valores negativos
+                when(col(col_name).startswith('-'), 
+                     -1 * regexp_replace(regexp_replace(col(col_name), '^-', ''), '\.', '').cast('double'))
+                .otherwise(
+                    regexp_replace(regexp_replace(col(col_name), '\.', ''), ',', '.').cast('double'))
+            )
+            converted_count += 1
+        except Exception as e:
+            print(f"Erro ao converter {col_name}: {str(e)}")
+            continue
     
-    encoder = OneHotEncoder(
-        inputCols=[f"{col}_idx" for col in reduced_cols],
-        outputCols=[f"{col}_encoded" for col in reduced_cols],
-        dropLast=drop_last
-    )
+    # Resumo final
+    print("\nResumo da conversão:")
+    print(f"• Colunas analisadas: {len(string_cols)}")
+    print(f"• Colunas detectadas como numéricas: {len(cols_to_convert)}")
+    print(f"• Colunas convertidas com sucesso: {converted_count}")
+    if len(cols_to_convert) > converted_count:
+        print(f"• Colunas com erro na conversão: {len(cols_to_convert) - converted_count}")
     
-    pipeline = Pipeline(stages=indexers + [encoder])
-    model = pipeline.fit(processed_df)
-    encoded_df = model.transform(processed_df)
-    
-    # 3. Pós-processamento
-    original_cols = [c for c in df.columns if c not in categorical_cols]
-    
-    # Renomear colunas codificadas
-    for orig_col in categorical_cols:
-        encoded_col = f"{orig_col}_reduced_encoded"
-        encoded_df = encoded_df.withColumnRenamed(encoded_col, orig_col)
-    
-    # Selecionar colunas finais
-    final_cols = original_cols + categorical_cols
-    if not drop_original:
-        final_cols += categorical_cols
-    
-    print("\nProcesso concluído com sucesso!")
-    return encoded_df.select(final_cols)
+    return df
 
-# 3. Exemplo de Uso com Dados Simulados
+# Exemplo de uso completo:
 if __name__ == "__main__":
-    print("="*50)
-    print("EXEMPLO PRÁTICO DE USO")
-    print("="*50)
+    from pyspark.sql import SparkSession
+    
+    spark = SparkSession.builder.appName("ConversionExample").getOrCreate()
     
     # Criar DataFrame de exemplo
     data = [
-        ("produto_A", "SP", "tipo_1"),
-        ("produto_B", "RJ", "tipo_2"),
-        ("produto_C", "MG", "tipo_1"),
-        ("produto_A", "SP", "tipo_3"),
-        ("produto_D", "RJ", "tipo_2"),
-        ("produto_A", "RS", "tipo_1"),
-        ("produto_B", "SP", "tipo_4"),
-        ("produto_E", "SP", "tipo_1"),  # Categoria rara
-        ("produto_F", "RJ", "tipo_5"),  # Categoria rara
-        ("produto_A", "MG", "tipo_1")
+        ("1.234,56", "100,50", "texto"),
+        ("-2.345,67", "200,75", "123"),
+        ("3.000,00", "ABC", "1.000"),
+        ("1.500,99", "300,25", "outro texto")
     ]
+    df = spark.createDataFrame(data, ["valor1", "valor2", "valor3"])
     
-    df_exemplo = spark.createDataFrame(data, ["produto", "estado", "tipo_cliente"])
+    print("DataFrame original:")
+    df.show()
     
-    print("\nDataFrame Original:")
-    df_exemplo.show()
+    # Aplicar a função
+    df_converted = convert_numeric_strings_with_log(df)
     
-    # Lista de colunas categóricas para transformar
-    cat_cols = ["produto", "estado", "tipo_cliente"]
-    
-    print("\nIniciando processo de OneHot Encoding otimizado...")
-    
-    # Aplicar a função com parâmetros restritivos para demonstração
-    df_encoded = optimized_onehot_encode_with_log(
-        df=df_exemplo,
-        categorical_cols=cat_cols,
-        min_freq=0.2,        # 20% de frequência mínima (para demo com pouco dados)
-        max_categories=2,    # Apenas 2 categorias por coluna (para demo)
-        drop_last=True
-    )
-    
-    print("\nDataFrame após OneHot Encoding:")
-    df_encoded.show()
-    
-    print("\nEsquema final:")
-    df_encoded.printSchema()
+    print("\nDataFrame após conversão:")
+    df_converted.show()
+    df_converted.printSchema()
